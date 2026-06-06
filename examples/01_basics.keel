@@ -1,0 +1,30 @@
+# Keel basics: bindings, checked arithmetic, control flow, functions
+
+def factorial(n: int); int:
+    mut acc = 1
+    mut i = 1
+    loop till i > n; ; i++:
+        acc = acc * i
+    return acc
+
+def fib(n: int); int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+def main(sys: System); Io:
+    println("factorial(5) =", factorial(5))
+    println("fib(10) =", fib(10))
+
+    # immutable by default
+    greeting = "Keel"
+    println("hello from #greeting")
+
+    # checked arithmetic, ranges, higher-order functions
+    nums = range(1, 6)
+    doubled = nums.map((x): x * 2)
+    println("doubled:", doubled)
+    println("sum:", doubled.sum())
+
+    # array broadcasting
+    println("broadcast [1,2,3] * 10 =", [1, 2, 3] * 10)

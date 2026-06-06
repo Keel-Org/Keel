@@ -1,0 +1,67 @@
+# ======================================================================
+# Flagship example (adapted from the spec's Appendix B) — runnable.
+#
+# One request handler demonstrating, together, in safe GC-free Keel:
+#   • capability-based authority (Db is passed in, not ambient)
+#   • effects instead of async/await  ({Io, Fail<AppError>})
+#   • context-typed queries           (sql"..."; injection cannot type-check)
+#   • trust typing                    (Untrusted<string> from the network)
+#   • refinement types                (int where >= 0, proven at the boundary)
+#   • derivation                      (derive (Eq, Json))
+#   • structured recovery             (execute / handle converts Fail to 400)
+#   • an inline test
+# ======================================================================
+
+derive (Eq, Json)
+struct User:
+    id: int where >= 0
+    name: string
+
+def parse_id(raw: Untrusted[string]); int where >= 0 / {Fail}:
+    # parsing untrusted input is the validation that yields a trusted, refined int
+    id: int where >= 0 = raw.to_int()?
+    return id
+
+def handle_lookup(req: Request, db: Db); Response / {Io, Fail}:
+    raw = req.query("id")                                  # Untrusted<string>
+    id = parse_id(raw)?                                    # drops Untrusted, proves >= 0
+    rows = db.run(sql"SELECT id, name FROM users WHERE id = #id")?   # injection can't type-check
+    check rows.first():
+        is some(u): return Response.json(u)
+        is none:    return Response.not_found("no such user")
+
+test "valid id returns the user":
+    db = fake_db([{id: 1, name: "Ada"}])
+    req = make_request({id: "1"})
+    resp = execute:
+        handle_lookup(req, db)?
+    handle Fail as e:
+        Response.error("bad request", 400)
+    assert resp.status == 200
+
+test "missing id yields a clean 400":
+    db = fake_db([{id: 1, name: "Ada"}])
+    req = make_request({})                                 # no id present
+    resp = execute:
+        handle_lookup(req, db)?
+    handle Fail as e:
+        Response.error("bad request", 400)
+    assert resp.status == 400
+
+def main(sys: System); Io:
+    db = sys.net.database("postgres://localhost/app")      # authority granted explicitly
+    db = fake_db([{id: 1, name: "Ada"}, {id: 2, name: "Alan"}])
+
+    println("GET /user?id=2")
+    resp = execute:
+        handle_lookup(make_request({id: "2"}), db)?
+    handle Fail as e:
+        Response.error("bad request", 400)
+    println("  ->", resp.status, resp.body)
+
+    println("GET /user?id=oops")
+    bad = execute:
+        handle_lookup(make_request({id: "oops"}), db)?
+    handle Fail as e:
+        Response.error("bad request", 400)
+    println("  ->", bad.status, bad.body)

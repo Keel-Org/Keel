@@ -1,0 +1,23 @@
+# First-class tests, including property tests with automatic shrinking
+
+def reverse(xs: array[int]); array[int]:
+    return xs.reverse()
+
+def add(a: int, b: int); int:
+    return a + b
+
+test "reverse twice is identity":
+    assert reverse(reverse([1, 2, 3])) == [1, 2, 3]
+
+test "addition is commutative":
+    assert add(2, 3) == add(3, 2)
+
+test prop "reversing twice restores the list" (xs: array[int]):
+    assert reverse(reverse(xs)) == xs
+
+test prop "addition never overflows for small ints" (a: int, b: int):
+    assert add(a, b) == add(b, a)
+
+# This property is FALSE on purpose — the runner should find & shrink a counterexample
+test prop "every int is positive (false!)" (n: int):
+    assert n > 0
