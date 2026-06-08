@@ -1,0 +1,135 @@
+DEF       69:72 'def'
+IDENT     73:83 'parse_port'
+LPAREN    83:84 '('
+IDENT     84:87 'raw'
+COLON     87:88 ':'
+IDENT     89:95 'string'
+RPAREN    95:96 ')'
+SEMI      96:97 ';'
+IDENT     98:101 'int'
+SLASH     102:103 '/'
+LBRACE    104:105 '{'
+IDENT     105:109 'Fail'
+RBRACE    109:110 '}'
+COLON     110:111 ':'
+NEWLINE   112:112
+INDENT    116:116
+IDENT     116:117 'n'
+ASSIGN    118:119 '='
+IDENT     120:123 'raw'
+DOT       123:124 '.'
+IDENT     124:130 'to_int'
+LPAREN    130:131 '('
+RPAREN    131:132 ')'
+QUESTION  132:133 '?'
+NEWLINE   134:134
+IF        138:140 'if'
+IDENT     141:142 'n'
+LT        143:144 '<'
+INT       145:146 '1'
+OR        147:149 'or'
+IDENT     150:151 'n'
+GT        152:153 '>'
+INT       154:159 '65535'
+COLON     159:160 ':'
+NEWLINE   161:161
+INDENT    169:169
+RETURN    169:175 'return'
+IDENT     176:180 'fail'
+LPAREN    180:181 '('
+STRING    181:200 '"port out of range"'
+RPAREN    200:201 ')'
+NEWLINE   202:202
+DEDENT    206:206
+RETURN    206:212 'return'
+IDENT     213:214 'n'
+NEWLINE   215:215
+DEDENT    216:216
+DEF       216:219 'def'
+IDENT     220:224 'main'
+LPAREN    224:225 '('
+IDENT     225:228 'sys'
+COLON     228:229 ':'
+IDENT     230:236 'System'
+RPAREN    236:237 ')'
+SEMI      237:238 ';'
+IDENT     239:241 'Io'
+COLON     241:242 ':'
+NEWLINE   243:243
+INDENT    320:320
+IDENT     320:324 'port'
+ASSIGN    325:326 '='
+EXECUTE   327:334 'execute'
+COLON     334:335 ':'
+NEWLINE   336:336
+INDENT    344:344
+IDENT     344:354 'parse_port'
+LPAREN    354:355 '('
+STRING    355:362 '"99999"'
+RPAREN    362:363 ')'
+QUESTION  363:364 '?'
+NEWLINE   365:365
+DEDENT    369:369
+HANDLE    369:375 'handle'
+IDENT     376:380 'Fail'
+IDENT     381:383 'as'
+IDENT     384:385 'e'
+COLON     385:386 ':'
+NEWLINE   387:387
+INDENT    395:395
+IDENT     395:402 'println'
+LPAREN    402:403 '('
+STRING    403:418 '"config error:"'
+COMMA     418:419 ','
+IDENT     420:421 'e'
+COMMA     421:422 ','
+STRING    423:441 '"-> using default"'
+RPAREN    441:442 ')'
+NEWLINE   443:443
+RESUME    451:457 'resume'
+INT       458:462 '8080'
+NEWLINE   463:463
+DEDENT    467:467
+IDENT     467:474 'println'
+LPAREN    474:475 '('
+STRING    475:494 '"listening on port"'
+COMMA     494:495 ','
+IDENT     496:500 'port'
+RPAREN    500:501 ')'
+NEWLINE   502:502
+IDENT     555:561 'result'
+ASSIGN    562:563 '='
+EXECUTE   564:571 'execute'
+COLON     571:572 ':'
+NEWLINE   573:573
+INDENT    581:581
+IDENT     581:584 'bad'
+ASSIGN    585:586 '='
+IDENT     587:597 'parse_port'
+LPAREN    597:598 '('
+STRING    598:603 '"abc"'
+RPAREN    603:604 ')'
+QUESTION  604:605 '?'
+NEWLINE   606:606
+STRING    614:624 '"got #bad"'
+NEWLINE   625:625
+DEDENT    629:629
+HANDLE    629:635 'handle'
+IDENT     636:640 'Fail'
+IDENT     641:643 'as'
+IDENT     644:645 'e'
+COLON     645:646 ':'
+NEWLINE   647:647
+INDENT    655:655
+STRING    655:680 '"fell back to safe value"'
+NEWLINE   681:681
+DEDENT    685:685
+IDENT     685:692 'println'
+LPAREN    692:693 '('
+STRING    693:702 '"result:"'
+COMMA     702:703 ','
+IDENT     704:710 'result'
+RPAREN    710:711 ')'
+NEWLINE   712:712
+DEDENT    712:712
+EOF       712:712

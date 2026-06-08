@@ -1,0 +1,28 @@
+def fib(n: int); int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+def gcd(a: int, b: int); int:
+    mut x = a
+    mut y = b
+    loop till y == 0:
+        t = y
+        y = x % y
+        x = t
+    return x
+
+def fact(n: int); int:
+    mut f = 1
+    mut k = n
+    loop till k < 1; ; k = k - 1:
+        f = f * k
+    return f
+
+def main(sys: System); Io:
+    println("fib(15) =", fib(15))
+    println("gcd(48,36) =", gcd(48, 36))
+    mut facts = []
+    loop till facts.len() >= 6; mut j = 0; j++:
+        facts = facts.push(fact(j))
+    println("factorials 0..5:", facts)

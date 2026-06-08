@@ -1,0 +1,1378 @@
+# ============================================================================
+# keelc — the Keel compiler, written in Keel (Tier 2.2 / 4.1 / 4.2).
+#
+# Pipeline:  source --lex--> tokens --parse--> AST --codegen--> C
+# The emitted C calls the shared runtime (runtime/keelrt.{h,c}), whose value
+# semantics mirror the Stage-0 interpreter, so a compiled binary is observably
+# equivalent to `keel run` (Tier 4.3). This program is written in the same
+# subset it compiles ("Keel-Core"), which is what makes the bootstrap a genuine
+# fixpoint: keelc compiles keelc.
+#
+# Keel-Core (the self-hosting subset) is the whole language minus surface
+# conveniences not yet needed to describe the compiler: string interpolation
+# (we build output with explicit concatenation), the full numeric tower
+# (ints/strings/bools/records/arrays suffice here), and closures. The Stage-0
+# oracle still accepts the full language; Part II moves the remaining surface
+# onto this same self-hosted front-end.
+# ============================================================================
+
+# ---- character helpers ----------------------------------------------------
+def is_id_start(c: string); bool:
+    return is_alpha(c) or c == "_"
+
+def is_id_char(c: string); bool:
+    return is_alnum(c) or c == "_"
+
+def is_ws(c: string); bool:
+    return c == " " or c == chr(9)
+
+def is_kw(w: string); bool:
+    kws = ["def", "struct", "enum", "interface", "class", "derive", "type",
+           "if", "elif", "else", "check", "is", "loop", "till", "through",
+           "return", "break", "continue", "assert", "and", "or", "not",
+           "mut", "let", "true", "false", "none", "import", "module",
+           "execute", "handle", "resume", "test", "prop", "where",
+           "shared", "comptime", "region", "parallel", "spawn", "scope",
+           "extern", "unsafe", "public", "private", "reflect", "total"]
+    loop through kws:
+        if it == w:
+            return true
+    return false
+
+# ---- token construction ----------------------------------------------------
+# A token is a record {cat, text, line}. cat is one of:
+#   "id" "int" "float" "str" "kw" "op" "nl" "indent" "dedent" "eof"
+# For "str" tokens an extra field `ctx` holds the context tag ("" for plain).
+def mk_tok(cat: string, text: string, line: int); Token:
+    return {cat: cat, text: text, line: line, ctx: ""}
+
+def mk_str_tok(text: string, ctx: string, line: int); Token:
+    return {cat: "str", text: text, line: line, ctx: ctx}
+
+# ---- string-literal scanning (handles \n \t \" \\ escapes) -----------------
+# Returns a record {value, next} : decoded content and index past closing quote.
+def scan_string_body(src: string, start: int); StrScan:
+    mut j = start + 1
+    mut out = ""
+    n = src.len()
+    loop till j >= n or src[j] == "\"":
+        c = src[j]
+        if c == "\\" and j + 1 < n:
+            d = src[j + 1]
+            if d == "n":
+                out = out + chr(10)
+            elif d == "t":
+                out = out + chr(9)
+            elif d == "\"":
+                out = out + "\""
+            elif d == "\\":
+                out = out + "\\"
+            else:
+                out = out + d
+            j = j + 2
+        else:
+            out = out + c
+            j = j + 1
+    return {value: out, next: j + 1}
+
+# ---- the lexer -------------------------------------------------------------
+# Significant indentation: an explicit indent stack drives indent/dedent.
+# Newlines outside brackets become "nl" tokens; blank and comment-only lines
+# are skipped. The token stream ends with a synthetic "eof".
+def lex(src: string); array[Token]:
+    mut toks = []
+    mut i = 0
+    n = src.len()
+    mut line = 1
+    mut indents = [0]
+    mut paren = 0
+    mut at_line_start = true
+    mut any_on_line = false
+
+    loop till i >= n:
+        # ---- indentation handling at the start of a logical line ----
+        if at_line_start and paren == 0:
+            mut p = i
+            mut width = 0
+            loop till p >= n or not is_ws(src[p]):
+                width = width + 1
+                p = p + 1
+            if p >= n:
+                i = p
+                continue
+            ch = src[p]
+            if ch == chr(10):
+                i = p + 1
+                line = line + 1
+                continue
+            if ch == "#":
+                loop till p >= n or src[p] == chr(10):
+                    p = p + 1
+                i = p
+                continue
+            # real content: reconcile indentation
+            i = p
+            cur = indents[indents.len() - 1]
+            if width > cur:
+                indents = indents.push(width)
+                toks = toks.push(mk_tok("indent", "", line))
+            else:
+                loop till indents[indents.len() - 1] <= width:
+                    indents = indents[0 -> indents.len() - 1]
+                    toks = toks.push(mk_tok("dedent", "", line))
+            at_line_start = false
+            any_on_line = false
+
+        if i >= n:
+            continue
+        c = src[i]
+
+        # ---- whitespace / comments / newlines ----
+        if c == " " or c == chr(9):
+            i = i + 1
+            continue
+        if c == "#":
+            loop till i >= n or src[i] == chr(10):
+                i = i + 1
+            continue
+        if c == chr(10):
+            i = i + 1
+            if paren == 0 and any_on_line:
+                toks = toks.push(mk_tok("nl", "", line))
+            line = line + 1
+            at_line_start = true
+            continue
+
+        any_on_line = true
+
+        # ---- numbers ----
+        if is_digit(c):
+            mut j = i
+            loop till j >= n or not is_digit(src[j]):
+                j = j + 1
+            mut isfloat = false
+            if j < n and src[j] == "." and j + 1 < n and is_digit(src[j + 1]):
+                isfloat = true
+                j = j + 1
+                loop till j >= n or not is_digit(src[j]):
+                    j = j + 1
+            txt = src[i -> j]
+            cat = isfloat ? "float" : "int"
+            toks = toks.push(mk_tok(cat, txt, line))
+            i = j
+            continue
+
+        # ---- identifiers / keywords / context-strings ----
+        if is_id_start(c):
+            mut j = i
+            loop till j >= n or not is_id_char(src[j]):
+                j = j + 1
+            word = src[i -> j]
+            if j < n and src[j] == "\"":
+                sc = scan_string_body(src, j)
+                toks = toks.push(mk_str_tok(sc.value, word, line))
+                i = sc.next
+                continue
+            kind = is_kw(word) ? "kw" : "id"
+            toks = toks.push(mk_tok(kind, word, line))
+            i = j
+            continue
+
+        # ---- plain strings ----
+        if c == "\"":
+            sc = scan_string_body(src, i)
+            toks = toks.push(mk_str_tok(sc.value, "", line))
+            i = sc.next
+            continue
+
+        # ---- operators (longest match) ----
+        d = i + 1 < n ? src[i + 1] : ""
+        two = c + d
+        if two == "==" or two == "!=" or two == "<=" or two == ">=" or two == "->" or two == "++" or two == "--" or two == "+=" or two == "-=" or two == "*=" or two == "/=" or two == "%=" or two == "**" or two == "?." or two == "??":
+            toks = toks.push(mk_tok("op", two, line))
+            i = i + 2
+            continue
+        if c == "(" or c == "[" or c == "{":
+            paren = paren + 1
+        if c == ")" or c == "]" or c == "}":
+            if paren > 0:
+                paren = paren - 1
+        toks = toks.push(mk_tok("op", c, line))
+        i = i + 1
+
+    # close any remaining indentation, then eof
+    loop till indents.len() <= 1:
+        indents = indents[0 -> indents.len() - 1]
+        toks = toks.push(mk_tok("dedent", "", line))
+    toks = toks.push(mk_tok("eof", "", line))
+    return toks
+
+# ============================================================================
+# PARSER  —  recursive descent over the token array into an AST of records.
+# Parser state is a single record threaded by reference: {toks, pos, errs}.
+# Every node is a record tagged with `nk` (node kind). The grammar and operator
+# precedence mirror the Stage-0 oracle so that parses agree.
+# ============================================================================
+
+def pcur(P: Parser); Token:
+    return P.toks[P.pos]
+
+def pcat(P: Parser); string:
+    return P.toks[P.pos].cat
+
+def ptext(P: Parser); string:
+    return P.toks[P.pos].text
+
+def padv(P: Parser); Token:
+    t = P.toks[P.pos]
+    P.pos = P.pos + 1
+    return t
+
+def at_op(P: Parser, s: string); bool:
+    return P.toks[P.pos].cat == "op" and P.toks[P.pos].text == s
+
+def at_kw(P: Parser, s: string); bool:
+    return P.toks[P.pos].cat == "kw" and P.toks[P.pos].text == s
+
+def eat_op(P: Parser, s: string); bool:
+    if at_op(P, s):
+        P.pos = P.pos + 1
+        return true
+    return false
+
+def eat_kw(P: Parser, s: string); bool:
+    if at_kw(P, s):
+        P.pos = P.pos + 1
+        return true
+    return false
+
+def perr(P: Parser, msg: string); int:
+    t = P.toks[P.pos]
+    P.errs = P.errs.push("parse error near '" + t.text + "' (" + t.cat + "): " + msg)
+    P.pos = P.pos + 1
+    return 0
+
+def expect_op(P: Parser, s: string); int:
+    if not eat_op(P, s):
+        perr(P, "expected '" + s + "'")
+    return 0
+
+def skip_nl(P: Parser); int:
+    loop till pcat(P) != "nl":
+        P.pos = P.pos + 1
+    return 0
+
+# ---- a block: indent, statements separated by newlines, dedent -------------
+def parse_block(P: Parser); array[Node]:
+    mut stmts = []
+    skip_nl(P)
+    if pcat(P) == "indent":
+        P.pos = P.pos + 1
+    skip_nl(P)
+    loop till pcat(P) == "dedent" or pcat(P) == "eof":
+        s = parse_stmt(P)
+        stmts = stmts.push(s)
+        skip_nl(P)
+    if pcat(P) == "dedent":
+        P.pos = P.pos + 1
+    return stmts
+
+# ---- types: consume a type expression, return its textual form -------------
+def parse_type(P: Parser); string:
+    mut out = ""
+    if at_kw(P, "shared"):
+        padv(P)
+        out = "shared "
+    # base name (ident or keyword-ish)
+    mut base = ptext(P)
+    padv(P)
+    out = out + base
+    # generic args  T[...]
+    if at_op(P, "["):
+        padv(P)
+        out = out + "["
+        loop till at_op(P, "]") or pcat(P) == "eof":
+            out = out + parse_type(P)
+            if eat_op(P, ","):
+                out = out + ","
+        expect_op(P, "]")
+        out = out + "]"
+    # option marker  T?
+    if at_op(P, "?"):
+        padv(P)
+        out = out + "?"
+    return out
+
+# ---- a where-refinement clause: capture predicate op + bound (ints) --------
+def parse_refine(P: Parser); Node:
+    mut r = {nk: "refine", op: "", bound: 0, has: false}
+    if at_op(P, ">=") or at_op(P, "<=") or at_op(P, ">") or at_op(P, "<") or at_op(P, "==") or at_op(P, "!="):
+        r.op = ptext(P)
+        padv(P)
+        if pcat(P) == "int":
+            r.bound = ptext(P).to_int()?
+            padv(P)
+            r.has = true
+        else:
+            # non-integer refinement: skip the rest of the expression token-wise
+            skip_refine_tail(P)
+    else:
+        skip_refine_tail(P)
+    return r
+
+def skip_refine_tail(P: Parser); int:
+    loop till at_op(P, "=") or pcat(P) == "nl" or pcat(P) == "eof":
+        P.pos = P.pos + 1
+    return 0
+
+# ---- parameters:  ( name: Type, ... ) --------------------------------------
+def parse_params(P: Parser); array[Node]:
+    mut params = []
+    expect_op(P, "(")
+    loop till at_op(P, ")") or pcat(P) == "eof":
+        pname = ptext(P)
+        padv(P)
+        mut ty = ""
+        if eat_op(P, ":"):
+            ty = parse_type(P)
+        params = params.push({nk: "param", name: pname, ty: ty})
+        if not eat_op(P, ","):
+            break
+    expect_op(P, ")")
+    return params
+
+# ---- def ------------------------------------------------------------------
+def parse_def(P: Parser); Node:
+    padv(P)                                  # 'def'
+    name = ptext(P)
+    padv(P)
+    params = parse_params(P)
+    mut ret = ""
+    mut effects = []
+    if eat_op(P, ";"):
+        if not at_op(P, ":") and not at_op(P, "{"):
+            ret = parse_type(P)
+        if at_op(P, "{"):
+            effects = parse_effects(P)
+    if at_op(P, "{"):
+        effects = parse_effects(P)
+    expect_op(P, ":")
+    body = parse_block(P)
+    return {nk: "def", name: name, params: params, ret: ret, effects: effects, body: body}
+
+def parse_effects(P: Parser); array[string]:
+    mut effs = []
+    expect_op(P, "{")
+    loop till at_op(P, "}") or pcat(P) == "eof":
+        effs = effs.push(ptext(P))
+        padv(P)
+        if not eat_op(P, ","):
+            break
+    expect_op(P, "}")
+    return effs
+
+# ---- struct / enum (parsed for the corpus; the compiler uses neither) ------
+def parse_struct(P: Parser); Node:
+    padv(P)                                  # 'struct'
+    name = ptext(P)
+    padv(P)
+    expect_op(P, ":")
+    skip_nl(P)
+    mut fields = []
+    if pcat(P) == "indent":
+        P.pos = P.pos + 1
+    skip_nl(P)
+    loop till pcat(P) == "dedent" or pcat(P) == "eof":
+        fname = ptext(P)
+        padv(P)
+        mut ty = ""
+        if eat_op(P, ":"):
+            ty = parse_type(P)
+            if eat_kw(P, "where"):
+                parse_refine(P)
+        fields = fields.push({nk: "field", name: fname, ty: ty})
+        skip_nl(P)
+    if pcat(P) == "dedent":
+        P.pos = P.pos + 1
+    return {nk: "struct", name: name, fields: fields}
+
+def parse_enum(P: Parser); Node:
+    padv(P)                                  # 'enum'
+    name = ptext(P)
+    padv(P)
+    expect_op(P, ":")
+    skip_nl(P)
+    mut variants = []
+    if pcat(P) == "indent":
+        P.pos = P.pos + 1
+    skip_nl(P)
+    loop till pcat(P) == "dedent" or pcat(P) == "eof":
+        vname = ptext(P)
+        padv(P)
+        mut payload = []
+        if at_op(P, "("):
+            padv(P)
+            loop till at_op(P, ")") or pcat(P) == "eof":
+                payload = payload.push(parse_type(P))
+                if not eat_op(P, ","):
+                    break
+            expect_op(P, ")")
+        variants = variants.push({nk: "variant", name: vname, payload: payload})
+        skip_nl(P)
+    if pcat(P) == "dedent":
+        P.pos = P.pos + 1
+    return {nk: "enum", name: name, variants: variants}
+
+# ---- statements ------------------------------------------------------------
+def parse_stmt(P: Parser); Node:
+    if at_kw(P, "return"):
+        padv(P)
+        if pcat(P) == "nl" or pcat(P) == "dedent" or pcat(P) == "eof":
+            return {nk: "return", value: {nk: "none"}}
+        return {nk: "return", value: parse_expr(P)}
+    if at_kw(P, "if"):
+        return parse_if(P)
+    if at_kw(P, "loop"):
+        return parse_loop(P)
+    if at_kw(P, "check"):
+        return parse_check(P)
+    if at_kw(P, "break"):
+        padv(P)
+        return {nk: "break"}
+    if at_kw(P, "continue"):
+        padv(P)
+        return {nk: "continue"}
+    if at_kw(P, "assert"):
+        padv(P)
+        cond = parse_expr(P)
+        mut msg = {nk: "none"}
+        if eat_op(P, ","):
+            msg = parse_expr(P)
+        return {nk: "assert", cond: cond, msg: msg}
+    if at_kw(P, "mut"):
+        padv(P)
+        return parse_binding(P, true)
+    if at_kw(P, "let"):
+        padv(P)
+        return parse_binding(P, false)
+    return parse_simple(P)
+
+# binding after optional mut/let : name [: Type [where ...]] = expr
+def parse_binding(P: Parser, is_mut: bool); Node:
+    name = ptext(P)
+    padv(P)
+    mut ty = ""
+    mut ref = {nk: "refine", op: "", bound: 0, has: false}
+    if eat_op(P, ":"):
+        ty = parse_type(P)
+        if eat_kw(P, "where"):
+            ref = parse_refine(P)
+    expect_op(P, "=")
+    init = parse_expr(P)
+    return {nk: "let", name: name, mutable: is_mut, ty: ty, ref: ref, init: init}
+
+# a simple statement: typed let, assignment, inc/dec, or bare expression
+def parse_simple(P: Parser); Node:
+    # typed let:  name : Type [where ...] = expr
+    if pcat(P) == "id" and P.toks[P.pos + 1].cat == "op" and P.toks[P.pos + 1].text == ":":
+        name = ptext(P)
+        padv(P)
+        padv(P)                              # ':'
+        ty = parse_type(P)
+        mut ref = {nk: "refine", op: "", bound: 0, has: false}
+        if eat_kw(P, "where"):
+            ref = parse_refine(P)
+        expect_op(P, "=")
+        init = parse_expr(P)
+        return {nk: "let", name: name, mutable: false, ty: ty, ref: ref, init: init}
+    lhs = parse_expr(P)
+    if at_op(P, "="):
+        padv(P)
+        rhs = parse_expr(P)
+        if lhs.nk == "id":
+            return {nk: "let", name: lhs.name, mutable: false, ty: "", ref: {nk: "refine", op: "", bound: 0, has: false}, init: rhs}
+        return {nk: "assign", op: "=", target: lhs, value: rhs}
+    if at_op(P, "+=") or at_op(P, "-=") or at_op(P, "*=") or at_op(P, "/=") or at_op(P, "%="):
+        op = ptext(P)
+        padv(P)
+        rhs = parse_expr(P)
+        return {nk: "assign", op: op, target: lhs, value: rhs}
+    if at_op(P, "++") or at_op(P, "--"):
+        op = ptext(P)
+        padv(P)
+        return {nk: "assign", op: op, target: lhs, value: {nk: "none"}}
+    return {nk: "exprstmt", expr: lhs}
+
+def parse_if(P: Parser); Node:
+    padv(P)                                  # 'if'
+    cond = parse_expr(P)
+    expect_op(P, ":")
+    then = parse_block(P)
+    mut elifs = []
+    mut els = []
+    mut has_else = false
+    skip_nl(P)
+    loop till not at_kw(P, "elif"):
+        padv(P)
+        ec = parse_expr(P)
+        expect_op(P, ":")
+        eb = parse_block(P)
+        elifs = elifs.push({nk: "elif", cond: ec, body: eb})
+        skip_nl(P)
+    if at_kw(P, "else"):
+        padv(P)
+        expect_op(P, ":")
+        els = parse_block(P)
+        has_else = true
+    return {nk: "if", cond: cond, then: then, elifs: elifs, els: els, has_else: has_else}
+
+def parse_loop(P: Parser); Node:
+    padv(P)                                  # 'loop'
+    if at_kw(P, "till"):
+        padv(P)
+        cond = parse_expr(P)
+        mut init = {nk: "none"}
+        mut step = {nk: "none"}
+        mut has_init = false
+        mut has_step = false
+        if eat_op(P, ";"):
+            if not at_op(P, ";") and not at_op(P, ":"):
+                init = parse_stmt(P)
+                has_init = true
+        if eat_op(P, ";"):
+            if not at_op(P, ";") and not at_op(P, ":"):
+                step = parse_stmt(P)
+                has_step = true
+        expect_op(P, ":")
+        body = parse_block(P)
+        return {nk: "loop_till", cond: cond, init: init, step: step, has_init: has_init, has_step: has_step, body: body}
+    if at_kw(P, "through"):
+        padv(P)
+        seq = parse_expr(P)
+        expect_op(P, ":")
+        body = parse_block(P)
+        return {nk: "loop_through", seq: seq, body: body}
+    expect_op(P, ":")
+    body = parse_block(P)
+    return {nk: "loop", body: body}
+
+def parse_check(P: Parser); Node:
+    padv(P)                                  # 'check'
+    subj = parse_expr(P)
+    expect_op(P, ":")
+    skip_nl(P)
+    mut arms = []
+    if pcat(P) == "indent":
+        P.pos = P.pos + 1
+    skip_nl(P)
+    loop till pcat(P) == "dedent" or pcat(P) == "eof":
+        if at_kw(P, "is"):
+            padv(P)
+            arm = parse_arm(P)
+            arms = arms.push(arm)
+        elif at_kw(P, "else"):
+            padv(P)
+            expect_op(P, ":")
+            eb = parse_block(P)
+            arms = arms.push({nk: "arm", kind: "else", variant: "", binds: [], body: eb})
+        else:
+            perr(P, "expected 'is' or 'else' in check")
+        skip_nl(P)
+    if pcat(P) == "dedent":
+        P.pos = P.pos + 1
+    return {nk: "check", subj: subj, arms: arms}
+
+# one match arm after 'is':  Variant(binds) :  |  none :  |  some(x) :  | literal :
+def parse_arm(P: Parser); Node:
+    if pcat(P) == "kw" and ptext(P) == "none":
+        padv(P)
+        expect_op(P, ":")
+        return {nk: "arm", kind: "none", variant: "", binds: [], body: parse_block(P)}
+    if pcat(P) == "id" or pcat(P) == "kw":
+        variant = ptext(P)
+        padv(P)
+        mut binds = []
+        if at_op(P, "("):
+            padv(P)
+            loop till at_op(P, ")") or pcat(P) == "eof":
+                binds = binds.push(ptext(P))
+                padv(P)
+                if not eat_op(P, ","):
+                    break
+            expect_op(P, ")")
+        expect_op(P, ":")
+        knd = variant == "some" ? "some" : (variant == "ok" ? "ok" : (variant == "fail" ? "fail" : "variant"))
+        return {nk: "arm", kind: knd, variant: variant, binds: binds, body: parse_block(P)}
+    # literal pattern
+    lit = parse_expr(P)
+    expect_op(P, ":")
+    return {nk: "arm", kind: "lit", variant: "", binds: [], lit: lit, body: parse_block(P)}
+
+# ---- expressions (precedence climbing, mirrors the oracle) -----------------
+def prec_of(P: Parser); int:
+    if pcat(P) != "op" and pcat(P) != "kw":
+        return -1
+    t = ptext(P)
+    if t == "or":
+        return 1
+    if t == "and":
+        return 2
+    if t == "??":
+        return 3
+    if t == "==" or t == "!=" or t == "<" or t == "<=" or t == ">" or t == ">=":
+        return 4
+    if t == "->":
+        return 5
+    if t == "+" or t == "-":
+        return 10
+    if t == "*" or t == "/" or t == "%":
+        return 11
+    if t == "**":
+        return 12
+    return -1
+
+def parse_expr(P: Parser); Node:
+    e = parse_binary(P, 1)
+    if at_op(P, "?"):
+        padv(P)
+        then = parse_expr(P)
+        expect_op(P, ":")
+        els = parse_expr(P)
+        return {nk: "ternary", cond: e, a: then, b: els}
+    return e
+
+def parse_binary(P: Parser, min_prec: int); Node:
+    mut left = parse_unary(P)
+    loop:
+        p = prec_of(P)
+        if p < min_prec:
+            break
+        op = ptext(P)
+        padv(P)
+        right_assoc = op == "**"
+        next_min = right_assoc ? p : p + 1
+        right = parse_binary(P, next_min)
+        nk = op == "and" or op == "or" ? "logical" : (op == "??" ? "qq" : (op == "->" ? "range" : "bin"))
+        left = {nk: nk, op: op, a: left, b: right}
+    return left
+
+def parse_unary(P: Parser); Node:
+    if at_kw(P, "not"):
+        padv(P)
+        return {nk: "unary", op: "not", a: parse_unary(P)}
+    if at_op(P, "-"):
+        padv(P)
+        return {nk: "unary", op: "-", a: parse_unary(P)}
+    e = parse_primary(P)
+    return parse_postfix(P, e)
+
+def parse_postfix(P: Parser, e0: Node); Node:
+    mut e = e0
+    loop:
+        if at_op(P, "("):
+            padv(P)
+            mut args = []
+            loop till at_op(P, ")") or pcat(P) == "eof":
+                # named arg?  name: value
+                if pcat(P) == "id" and P.toks[P.pos + 1].cat == "op" and P.toks[P.pos + 1].text == ":":
+                    an = ptext(P)
+                    padv(P)
+                    padv(P)
+                    args = args.push({nk: "namedarg", name: an, a: parse_expr(P)})
+                else:
+                    args = args.push(parse_expr(P))
+                if not eat_op(P, ","):
+                    break
+            expect_op(P, ")")
+            e = {nk: "call", callee: e, args: args}
+        elif at_op(P, "["):
+            padv(P)
+            first = parse_expr(P)
+            if first.nk == "range":
+                e = {nk: "slice", base: e, lo: first.a, hi: first.b}
+            else:
+                e = {nk: "index", base: e, idx: first}
+            expect_op(P, "]")
+        elif at_op(P, "."):
+            padv(P)
+            nm = ptext(P)
+            padv(P)
+            e = {nk: "field", base: e, name: nm}
+        elif at_op(P, "?."):
+            padv(P)
+            nm = ptext(P)
+            padv(P)
+            e = {nk: "qdot", base: e, name: nm}
+        elif at_op(P, "?") and try_terminator(P):
+            padv(P)
+            e = {nk: "try", a: e}
+        else:
+            break
+    return e
+
+def is_sep_text(t: string); bool:
+    return t == ")" or t == "]" or t == "}" or t == "," or t == ";" or t == ":"
+
+def try_terminator(P: Parser); bool:
+    nx = P.toks[P.pos + 1]
+    if nx.cat == "nl" or nx.cat == "dedent" or nx.cat == "eof":
+        return true
+    if nx.cat == "op" and is_sep_text(nx.text):
+        return true
+    return false
+
+def parse_primary(P: Parser); Node:
+    c = pcat(P)
+    if c == "int":
+        v = ptext(P).to_int()?
+        padv(P)
+        return {nk: "int", num: v}
+    if c == "float":
+        t = ptext(P)
+        padv(P)
+        return {nk: "float", text: t}
+    if c == "str":
+        tok = padv(P)
+        return {nk: "str", text: tok.text, ctx: tok.ctx}
+    if c == "kw":
+        t = ptext(P)
+        if t == "true":
+            padv(P)
+            return {nk: "bool", num: 1}
+        if t == "false":
+            padv(P)
+            return {nk: "bool", num: 0}
+        if t == "none":
+            padv(P)
+            return {nk: "none"}
+        if t == "check":
+            return parse_check(P)
+        if t == "if":
+            return parse_if(P)
+        # otherwise treat keyword as identifier-like (e.g. types in calls)
+        padv(P)
+        return {nk: "id", name: t}
+    if c == "id":
+        nm = ptext(P)
+        padv(P)
+        return {nk: "id", name: nm}
+    if at_op(P, "("):
+        padv(P)
+        e = parse_expr(P)
+        expect_op(P, ")")
+        return e
+    if at_op(P, "["):
+        padv(P)
+        mut items = []
+        loop till at_op(P, "]") or pcat(P) == "eof":
+            items = items.push(parse_expr(P))
+            if not eat_op(P, ","):
+                break
+        expect_op(P, "]")
+        return {nk: "array", items: items}
+    if at_op(P, "{"):
+        padv(P)
+        mut fields = []
+        loop till at_op(P, "}") or pcat(P) == "eof":
+            fn = ptext(P)
+            padv(P)
+            expect_op(P, ":")
+            fields = fields.push({nk: "namedarg", name: fn, a: parse_expr(P)})
+            if not eat_op(P, ","):
+                break
+        expect_op(P, "}")
+        return {nk: "record", fields: fields}
+    perr(P, "expected expression")
+    return {nk: "none"}
+
+# ---- top level: a sequence of declarations --------------------------------
+def parse_program(toks: array[Token]); Node:
+    mut P = {toks: toks, pos: 0, errs: []}
+    mut decls = []
+    skip_nl(P)
+    loop till pcat(P) == "eof":
+        if at_kw(P, "def"):
+            decls = decls.push(parse_def(P))
+        elif at_kw(P, "struct"):
+            decls = decls.push(parse_struct(P))
+        elif at_kw(P, "enum"):
+            decls = decls.push(parse_enum(P))
+        elif at_kw(P, "derive"):
+            # derive(...) attaches to the following type; consume and ignore
+            padv(P)
+            skip_balanced(P)
+        elif at_kw(P, "import") or at_kw(P, "module"):
+            # single-file compiler: consume the line
+            loop till pcat(P) == "nl" or pcat(P) == "eof":
+                P.pos = P.pos + 1
+        elif at_kw(P, "test"):
+            # tests are not compiled; skip the block
+            skip_decl_block(P)
+        else:
+            perr(P, "expected a top-level declaration")
+        skip_nl(P)
+    return {nk: "program", decls: decls, errs: P.errs}
+
+def skip_balanced(P: Parser); int:
+    if at_op(P, "("):
+        mut depth = 0
+        loop:
+            if at_op(P, "("):
+                depth = depth + 1
+            elif at_op(P, ")"):
+                depth = depth - 1
+                if depth == 0:
+                    padv(P)
+                    break
+            if pcat(P) == "eof":
+                break
+            padv(P)
+    return 0
+
+def skip_decl_block(P: Parser); int:
+    loop till at_op(P, ":") or pcat(P) == "eof":
+        P.pos = P.pos + 1
+    eat_op(P, ":")
+    skip_nl(P)
+    if pcat(P) == "indent":
+        mut depth = 1
+        P.pos = P.pos + 1
+        loop till depth == 0 or pcat(P) == "eof":
+            if pcat(P) == "indent":
+                depth = depth + 1
+            elif pcat(P) == "dedent":
+                depth = depth - 1
+            P.pos = P.pos + 1
+    return 0
+
+# ============================================================================
+# CODEGEN  —  walk the AST and emit C against the shared runtime (keelrt).
+# Every Keel function becomes `static kl kf_<name>(kl ...)`. Values use the
+# tagged `kl` type; operations become runtime calls. Keel lexical scoping is
+# mirrored with C block scoping plus a scope stack (declare-on-first-let).
+# Traversal order and gensym are deterministic, so the bootstrap reaches a
+# byte-identical fixpoint.
+# ============================================================================
+
+def pad(d: int); string:
+    mut s = ""
+    mut i = 0
+    loop till i >= d:
+        s = s + "    "
+        i = i + 1
+    return s
+
+def cesc(s: string); string:
+    mut out = ""
+    mut i = 0
+    n = s.len()
+    loop till i >= n:
+        c = s[i]
+        if c == "\\":
+            out = out + "\\\\"
+        elif c == "\"":
+            out = out + "\\\""
+        elif c == chr(10):
+            out = out + "\\n"
+        elif c == chr(9):
+            out = out + "\\t"
+        elif c == chr(13):
+            out = out + "\\r"
+        else:
+            out = out + c
+        i = i + 1
+    return out
+
+def gensym(G: Gen, pre: string); string:
+    name = pre + str(G.tmp)
+    G.tmp = G.tmp + 1
+    return name
+
+# ---- scope stack -----------------------------------------------------------
+def push_scope(G: Gen); int:
+    G.scopes = G.scopes.push([])
+    return 0
+
+def pop_scope(G: Gen); int:
+    G.scopes = G.scopes[0 -> G.scopes.len() - 1]
+    return 0
+
+def declared(G: Gen, name: string); bool:
+    mut si = 0
+    loop till si >= G.scopes.len():
+        sc = G.scopes[si]
+        loop through sc:
+            if it == name:
+                return true
+        si = si + 1
+    return false
+
+def declare(G: Gen, name: string); int:
+    top = G.scopes[G.scopes.len() - 1]
+    top.push(name)
+    return 0
+
+# ---- name classification ---------------------------------------------------
+def is_user_func(G: Gen, name: string); bool:
+    loop through G.funcs:
+        if it == name:
+            return true
+    return false
+
+def is_variant(G: Gen, name: string); bool:
+    loop through G.variants:
+        if it == name:
+            return true
+    return false
+
+def is_struct(G: Gen, name: string); bool:
+    loop through G.structs:
+        if it.name == name:
+            return true
+    return false
+
+def struct_fields(G: Gen, name: string); array[string]:
+    loop through G.structs:
+        if it.name == name:
+            return it.fnames
+    return []
+
+# ---- a value array for builtin/method calls --------------------------------
+def emit_argv_call(G: Gen, prefix: string, args: array[Node]); string:
+    n = args.len()
+    if n == 0:
+        return prefix + ",0,0)"
+    mut s = "({ kl _a[" + str(n) + "]; "
+    mut i = 0
+    loop through args:
+        s = s + "_a[" + str(i) + "]=" + emit_expr(G, it) + "; "
+        i = i + 1
+    return s + prefix + ",_a," + str(n) + "); })"
+
+def emit_user_call(G: Gen, name: string, args: array[Node]); string:
+    mut s = "kf_" + name + "("
+    mut i = 0
+    loop through args:
+        if i > 0:
+            s = s + ","
+        a = it.nk == "namedarg" ? it.a : it
+        s = s + emit_expr(G, a)
+        i = i + 1
+    return s + ")"
+
+def emit_struct_ctor(G: Gen, name: string, args: array[Node]); string:
+    fields = struct_fields(G, name)
+    t = gensym(G, "_r")
+    mut s = "({ kl " + t + "=kl_rec_new(\"" + name + "\"); "
+    mut i = 0
+    loop through fields:
+        s = s + "kl_rec_set(" + t + ",\"" + it + "\"," + emit_expr(G, args[i]) + "); "
+        i = i + 1
+    return s + t + "; })"
+
+def emit_variant_ctor(G: Gen, name: string, args: array[Node]); string:
+    n = args.len()
+    if n == 0:
+        return "kl_enum0(\"" + name + "\")"
+    mut s = "kl_enumN(\"" + name + "\"," + str(n)
+    loop through args:
+        s = s + "," + emit_expr(G, it)
+    return s + ")"
+
+def emit_call(G: Gen, e: Node); string:
+    callee = e.callee
+    args = e.args
+    if callee.nk == "field":
+        recv = emit_expr(G, callee.base)
+        return emit_argv_call(G, "kl_method(" + recv + ",\"" + callee.name + "\"", args)
+    if callee.nk == "id":
+        nm = callee.name
+        if is_struct(G, nm):
+            return emit_struct_ctor(G, nm, args)
+        if is_variant(G, nm):
+            return emit_variant_ctor(G, nm, args)
+        if is_user_func(G, nm):
+            return emit_user_call(G, nm, args)
+        return emit_argv_call(G, "kl_builtin(\"" + nm + "\"", args)
+    return "kl_none()"
+
+def emit_array(G: Gen, items: array[Node]); string:
+    n = items.len()
+    if n == 0:
+        return "kl_arr_new()"
+    mut s = "kl_arr_lit(" + str(n)
+    loop through items:
+        s = s + "," + emit_expr(G, it)
+    return s + ")"
+
+def emit_record(G: Gen, fields: array[Node]); string:
+    t = gensym(G, "_r")
+    mut s = "({ kl " + t + "=kl_rec_new(\"\"); "
+    loop through fields:
+        s = s + "kl_rec_set(" + t + ",\"" + it.name + "\"," + emit_expr(G, it.a) + "); "
+    return s + t + "; })"
+
+# ---- the last expression of a block, as a C value (for check/if as value) --
+def block_value(G: Gen, stmts: array[Node], d: int); string:
+    n = stmts.len()
+    if n == 0:
+        return "kl_none()"
+    mut s = ""
+    mut i = 0
+    loop through stmts:
+        if i == n - 1 and it.nk == "exprstmt":
+            s = s + emit_expr(G, it.expr)
+        elif i == n - 1:
+            s = s + emit_stmt(G, it, d) + " kl_none()"
+        else:
+            s = s + emit_stmt(G, it, d) + " "
+        i = i + 1
+    return s
+
+def emit_check_expr(G: Gen, e: Node); string:
+    subj = gensym(G, "_subj")
+    cv = gensym(G, "_cv")
+    mut s = "({ kl " + cv + "=kl_none(); kl " + subj + "=" + emit_expr(G, e.subj) + "; "
+    mut first = true
+    loop through e.arms:
+        push_scope(G)
+        binds = arm_binds(G, subj, it)
+        body = block_value(G, it.body, 0)
+        pop_scope(G)
+        if it.kind == "else":
+            s = s + "else { " + binds + cv + "=" + body + "; } "
+        else:
+            kw = first ? "if" : "else if"
+            cond = arm_cond(G, subj, it)
+            s = s + kw + "(" + cond + "){ " + binds + cv + "=" + body + "; } "
+            first = false
+    return s + cv + "; })"
+
+# ---- expression codegen ----------------------------------------------------
+def emit_expr(G: Gen, e: Node); string:
+    k = e.nk
+    if k == "int":
+        return "kl_int(" + str(e.num) + "LL)"
+    if k == "float":
+        return "kl_float(" + e.text + ")"
+    if k == "bool":
+        return "kl_bool(" + str(e.num) + ")"
+    if k == "none":
+        return "kl_none()"
+    if k == "str":
+        if e.ctx == "":
+            return "kl_str(\"" + cesc(e.text) + "\")"
+        return "({ kl_sb _s; kl_sb_init(&_s); kl_sb_lit(&_s,\"" + cesc(e.text) + "\"); kl_sb_finish(&_s,\"" + e.ctx + "\"); })"
+    if k == "id":
+        if is_variant(G, e.name) and not declared(G, e.name):
+            return "kl_enum0(\"" + e.name + "\")"
+        return "kv_" + e.name
+    if k == "unary":
+        if e.op == "not":
+            return "kl_bool(!kl_truthy(" + emit_expr(G, e.a) + "))"
+        return "kl_neg(" + emit_expr(G, e.a) + ")"
+    if k == "bin":
+        return "kl_binop(\"" + e.op + "\"," + emit_expr(G, e.a) + "," + emit_expr(G, e.b) + ")"
+    if k == "qq":
+        return "kl_qq(" + emit_expr(G, e.a) + "," + emit_expr(G, e.b) + ")"
+    if k == "range":
+        return "kl_range(" + emit_expr(G, e.a) + "," + emit_expr(G, e.b) + ")"
+    if k == "logical":
+        t = gensym(G, "_lg")
+        if e.op == "and":
+            return "({ kl " + t + "=" + emit_expr(G, e.a) + "; kl_truthy(" + t + ")?(" + emit_expr(G, e.b) + "):" + t + "; })"
+        return "({ kl " + t + "=" + emit_expr(G, e.a) + "; kl_truthy(" + t + ")?" + t + ":(" + emit_expr(G, e.b) + "); })"
+    if k == "ternary":
+        return "(kl_truthy(" + emit_expr(G, e.cond) + ")?(" + emit_expr(G, e.a) + "):(" + emit_expr(G, e.b) + "))"
+    if k == "index":
+        return "kl_index(" + emit_expr(G, e.base) + "," + emit_expr(G, e.idx) + ")"
+    if k == "slice":
+        lo = e.lo.nk == "none" ? "kl_int(0)" : emit_expr(G, e.lo)
+        hiarg = e.hi.nk == "none" ? "0" : emit_expr(G, e.hi)
+        return "kl_slice(" + emit_expr(G, e.base) + "," + lo + "," + hiarg + ")"
+    if k == "field":
+        return "kl_field(" + emit_expr(G, e.base) + ",\"" + e.name + "\")"
+    if k == "qdot":
+        t = gensym(G, "_qd")
+        return "({ kl " + t + "=" + emit_expr(G, e.base) + "; kl_is_none(" + t + ")?kl_none():kl_field(" + t + ",\"" + e.name + "\"); })"
+    if k == "try":
+        return "kl_try(" + emit_expr(G, e.a) + ")"
+    if k == "array":
+        return emit_array(G, e.items)
+    if k == "record":
+        return emit_record(G, e.fields)
+    if k == "call":
+        return emit_call(G, e)
+    if k == "check":
+        return emit_check_expr(G, e)
+    return "kl_none()"
+
+# ---- match-arm helpers -----------------------------------------------------
+def arm_cond(G: Gen, subj: string, arm: Node); string:
+    if arm.kind == "none":
+        return "kl_is_none(" + subj + ")"
+    if arm.kind == "some":
+        return "kl_is_some(" + subj + ")"
+    if arm.kind == "lit":
+        return "kl_eq(" + subj + "," + emit_expr(G, arm.lit) + ")"
+    if arm.kind == "else":
+        return "1"
+    return "kl_is_variant(" + subj + ",\"" + arm.variant + "\")"
+
+def arm_binds(G: Gen, subj: string, arm: Node); string:
+    mut s = ""
+    if arm.kind == "some":
+        if arm.binds.len() > 0:
+            bn = arm.binds[0]
+            declare(G, bn)
+            s = s + "kl kv_" + bn + "=kl_some_val(" + subj + "); "
+        return s
+    mut i = 0
+    loop through arm.binds:
+        declare(G, it)
+        s = s + "kl kv_" + it + "=kl_payload(" + subj + "," + str(i) + "); "
+        i = i + 1
+    return s
+
+# ---- statement codegen -----------------------------------------------------
+def emit_block(G: Gen, stmts: array[Node], d: int); string:
+    push_scope(G)
+    mut parts = []
+    loop through stmts:
+        parts = parts.push(emit_stmt(G, it, d))
+    pop_scope(G)
+    return parts.join("")
+
+def refine_wrap(rhs: string, ref: Node, name: string); string:
+    if ref.has:
+        return "kl_refine_int(" + rhs + ",\"" + ref.op + "\"," + str(ref.bound) + "LL,\"" + name + "\")"
+    return rhs
+
+def emit_let(G: Gen, s: Node, d: int); string:
+    mut rhs = emit_expr(G, s.init)
+    if s.ty != "":
+        rhs = "kl_coerce(" + rhs + ",\"" + s.ty + "\")"
+    rhs = refine_wrap(rhs, s.ref, s.name)
+    if declared(G, s.name):
+        return pad(d) + "kv_" + s.name + " = " + rhs + ";\n"
+    declare(G, s.name)
+    return pad(d) + "kl kv_" + s.name + " = " + rhs + ";\n"
+
+def lvalue_set(G: Gen, target: Node, valexpr: string); string:
+    if target.nk == "id":
+        return "kv_" + target.name + " = " + valexpr + ";"
+    if target.nk == "field":
+        return "kl_setfield(" + emit_expr(G, target.base) + ",\"" + target.name + "\"," + valexpr + ");"
+    return "kl_setindex(" + emit_expr(G, target.base) + "," + emit_expr(G, target.idx) + "," + valexpr + ");"
+
+def emit_assign(G: Gen, s: Node, d: int); string:
+    op = s.op
+    if op == "=":
+        return pad(d) + lvalue_set(G, s.target, emit_expr(G, s.value)) + "\n"
+    if op == "++":
+        v = "kl_binop(\"+\"," + emit_expr(G, s.target) + ",kl_int(1LL))"
+        return pad(d) + lvalue_set(G, s.target, v) + "\n"
+    if op == "--":
+        v = "kl_binop(\"-\"," + emit_expr(G, s.target) + ",kl_int(1LL))"
+        return pad(d) + lvalue_set(G, s.target, v) + "\n"
+    bop = op[0 -> 1]
+    v = "kl_binop(\"" + bop + "\"," + emit_expr(G, s.target) + "," + emit_expr(G, s.value) + ")"
+    return pad(d) + lvalue_set(G, s.target, v) + "\n"
+
+def strip_semi(s: string); string:
+    if s.len() > 0 and s[s.len() - 1] == ";":
+        return s[0 -> s.len() - 1]
+    return s
+
+def emit_inline(G: Gen, s: Node); string:
+    if s.nk == "let":
+        rhs = emit_expr(G, s.init)
+        if declared(G, s.name):
+            return "kv_" + s.name + " = " + rhs
+        declare(G, s.name)
+        return "kl kv_" + s.name + " = " + rhs
+    if s.nk == "assign":
+        op = s.op
+        if op == "=":
+            return strip_semi(lvalue_set(G, s.target, emit_expr(G, s.value)))
+        if op == "++":
+            return strip_semi(lvalue_set(G, s.target, "kl_binop(\"+\"," + emit_expr(G, s.target) + ",kl_int(1LL))"))
+        if op == "--":
+            return strip_semi(lvalue_set(G, s.target, "kl_binop(\"-\"," + emit_expr(G, s.target) + ",kl_int(1LL))"))
+        bop = op[0 -> 1]
+        return strip_semi(lvalue_set(G, s.target, "kl_binop(\"" + bop + "\"," + emit_expr(G, s.target) + "," + emit_expr(G, s.value) + ")"))
+    return ""
+
+def emit_stmt(G: Gen, s: Node, d: int); string:
+    k = s.nk
+    if k == "let":
+        return emit_let(G, s, d)
+    if k == "assign":
+        return emit_assign(G, s, d)
+    if k == "return":
+        return pad(d) + "_ret = " + emit_expr(G, s.value) + "; goto _end;\n"
+    if k == "exprstmt":
+        return pad(d) + emit_expr(G, s.expr) + ";\n"
+    if k == "break":
+        return pad(d) + "break;\n"
+    if k == "continue":
+        return pad(d) + "continue;\n"
+    if k == "assert":
+        return pad(d) + "if(!kl_truthy(" + emit_expr(G, s.cond) + ")) kl_panic(\"assert.fail\",\"assertion failed\");\n"
+    if k == "if":
+        return emit_if(G, s, d)
+    if k == "loop":
+        return pad(d) + "for(;;){\n" + emit_block(G, s.body, d + 1) + pad(d) + "}\n"
+    if k == "loop_till":
+        return emit_loop_till(G, s, d)
+    if k == "loop_through":
+        return emit_loop_through(G, s, d)
+    if k == "check":
+        return emit_check_stmt(G, s, d)
+    return pad(d) + "/* stmt? */\n"
+
+def emit_if(G: Gen, s: Node, d: int); string:
+    mut out = pad(d) + "if(kl_truthy(" + emit_expr(G, s.cond) + ")){\n"
+    out = out + emit_block(G, s.then, d + 1) + pad(d) + "}"
+    loop through s.elifs:
+        out = out + " else if(kl_truthy(" + emit_expr(G, it.cond) + ")){\n" + emit_block(G, it.body, d + 1) + pad(d) + "}"
+    if s.has_else:
+        out = out + " else {\n" + emit_block(G, s.els, d + 1) + pad(d) + "}"
+    return out + "\n"
+
+def emit_loop_till(G: Gen, s: Node, d: int); string:
+    push_scope(G)
+    mut init = ""
+    if s.has_init:
+        init = emit_inline(G, s.init)
+    mut step = ""
+    if s.has_step:
+        step = emit_inline(G, s.step)
+    cond = emit_expr(G, s.cond)
+    mut body = ""
+    loop through s.body:
+        body = body + emit_stmt(G, it, d + 1)
+    pop_scope(G)
+    return pad(d) + "for(" + init + "; !kl_truthy(" + cond + "); " + step + "){\n" + body + pad(d) + "}\n"
+
+def emit_loop_through(G: Gen, s: Node, d: int); string:
+    sq = gensym(G, "_sq")
+    ix = gensym(G, "_ix")
+    seqexpr = emit_expr(G, s.seq)
+    push_scope(G)
+    declare(G, "it")
+    declare(G, "i")
+    mut body = ""
+    loop through s.body:
+        body = body + emit_stmt(G, it, d + 2)
+    pop_scope(G)
+    mut out = pad(d) + "{ kl " + sq + " = " + seqexpr + ";\n"
+    out = out + pad(d + 1) + "for(int " + ix + "=0; " + ix + "<kl_len(" + sq + "); " + ix + "++){\n"
+    out = out + pad(d + 2) + "kl kv_it = kl_index(" + sq + ",kl_int((int64_t)" + ix + "));\n"
+    out = out + pad(d + 2) + "kl kv_i = kl_int((int64_t)" + ix + ");\n"
+    out = out + body
+    out = out + pad(d + 1) + "}\n" + pad(d) + "}\n"
+    return out
+
+def emit_check_stmt(G: Gen, s: Node, d: int); string:
+    subj = gensym(G, "_subj")
+    mut out = pad(d) + "{ kl " + subj + " = " + emit_expr(G, s.subj) + ";\n"
+    mut first = true
+    loop through s.arms:
+        push_scope(G)
+        binds = arm_binds(G, subj, it)
+        body = emit_block(G, it.body, d + 2)
+        pop_scope(G)
+        if it.kind == "else":
+            out = out + pad(d + 1) + "else {\n" + pad(d + 2) + binds + "\n" + body + pad(d + 1) + "}\n"
+        else:
+            kw = first ? "if" : "else if"
+            cond = arm_cond(G, subj, it)
+            out = out + pad(d + 1) + kw + "(" + cond + "){\n" + pad(d + 2) + binds + "\n" + body + pad(d + 1) + "}\n"
+            first = false
+    return out + pad(d) + "}\n"
+
+# ---- function & program codegen -------------------------------------------
+def emit_func(G: Gen, fn: Node); string:
+    G.tmp = 0
+    G.scopes = [[]]
+    mut sig = "static kl kf_" + fn.name + "("
+    mut i = 0
+    loop through fn.params:
+        if i > 0:
+            sig = sig + ", "
+        sig = sig + "kl kv_" + it.name
+        declare(G, it.name)
+        i = i + 1
+    if fn.params.len() == 0:
+        sig = sig + "void"
+    sig = sig + ")"
+    mut parts = []
+    parts = parts.push(sig + " {\n")
+    parts = parts.push("    kl _ret = kl_none();\n")
+    parts = parts.push("    KlHandler _b; kl_push_handler(&_b, 1);\n")
+    parts = parts.push("    if(setjmp(_b.abort)){ _ret = _b.result; kl_pop_handler(&_b); return _ret; }\n")
+    loop through fn.body:
+        parts = parts.push(emit_stmt(G, it, 1))
+    parts = parts.push("    _end: ;\n")
+    parts = parts.push("    kl_pop_handler(&_b);\n")
+    parts = parts.push("    return _ret;\n}\n\n")
+    return parts.join("")
+
+def collect_names(G: Gen, prog: Node); int:
+    loop through prog.decls:
+        if it.nk == "def":
+            G.funcs = G.funcs.push(it.name)
+        elif it.nk == "struct":
+            mut fns = []
+            loop through it.fields:
+                fns = fns.push(it.name)
+            G.structs = G.structs.push({name: it.name, fnames: fns})
+        elif it.nk == "enum":
+            loop through it.variants:
+                G.variants = G.variants.push(it.name)
+    return 0
+
+def codegen(prog: Node); string:
+    mut G = {tmp: 0, scopes: [[]], funcs: [], structs: [], variants: []}
+    collect_names(G, prog)
+    mut parts = []
+    parts = parts.push("/* generated by keelc - the Keel compiler, written in Keel */\n")
+    parts = parts.push(chr(35) + "include \"keelrt.h\"\n\n")
+    loop through prog.decls:
+        if it.nk == "def":
+            mut sig = "static kl kf_" + it.name + "("
+            mut i = 0
+            loop through it.params:
+                if i > 0:
+                    sig = sig + ", "
+                sig = sig + "kl"
+                i = i + 1
+            if it.params.len() == 0:
+                sig = sig + "void"
+            parts = parts.push(sig + ");\n")
+    parts = parts.push("\n")
+    loop through prog.decls:
+        if it.nk == "def":
+            parts = parts.push(emit_func(G, it))
+    parts = parts.push("int main(int argc, char **argv){\n")
+    parts = parts.push("    kl _sys = kl_system(argc, argv);\n")
+    parts = parts.push("    kl _r = kf_main(_sys);\n")
+    parts = parts.push("    kl_main_done(_r);\n")
+    parts = parts.push("    kl_free_all();\n")
+    parts = parts.push("    return 0;\n}\n")
+    return parts.join("")
+
+# ---- entry point: lex → parse → codegen → emit C to stdout ----------------
+def main(sys: System); Io:
+    path = sys.args[0]
+    f = sys.fs.open(path)?
+    src = f.read()?
+    toks = lex(src)
+    prog = parse_program(toks)
+    if prog.errs.len() > 0:
+        loop through prog.errs:
+            println("keelc: ", it)
+        return
+    print(codegen(prog))
+

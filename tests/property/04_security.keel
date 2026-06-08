@@ -1,0 +1,34 @@
+# Capability-based authority + context-typed strings close whole bug classes
+
+def lookup(db: Db, raw_id: Untrusted[string]); Response / {Fail}:
+    # validation boundary: refinement proves >= 0 and strips Untrusted
+    id: int where >= 0 = raw_id.to_int()?
+    # only a parameterized sql"" value can reach db.run — a plain string can't
+    rows = db.run(sql"SELECT name FROM users WHERE id = #id")?
+    check rows.first():
+        is some(row): return Response.json(row)
+        is none: return Response.not_found("no such user")
+
+def main(sys: System); Io:
+    db = fake_db([{name: "Ada"}])
+
+    # a secret never prints its contents
+    token = secret("hunter2")
+    println("token in logs:", token)
+    println("revealed only deliberately:", reveal(token))
+
+    # capability narrowing + path-traversal rejection
+    logs = sys.fs.subtree("/var/log")
+    println("narrowed capability root ok")
+    execute:
+        escaped = sys.fs.subtree("../../etc")
+        println("should not reach here")
+    handle Fail as e:
+        println("traversal blocked:", e)
+
+    # untrusted input flows through validation
+    resp = execute:
+        lookup(db, untrusted("1"))?
+    handle Fail as e:
+        Response.error("bad request")
+    println("response status:", resp.status, "body:", resp.body)

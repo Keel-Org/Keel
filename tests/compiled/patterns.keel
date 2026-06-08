@@ -1,0 +1,27 @@
+enum Shape:
+    Circle(int)
+    Rect(int, int)
+    Dot
+
+def area(s: Shape); int:
+    check s:
+        is Circle(r):
+            return 3 * r * r
+        is Rect(w, h):
+            return w * h
+        is Dot:
+            return 0
+    return -1
+
+def classify(n: int); string:
+    check n:
+        is 0:
+            return "zero"
+        else:
+            return n > 0 ? "positive" : "negative"
+
+def main(sys: System); Io:
+    shapes = [Circle(2), Rect(3, 4), Dot]
+    loop through shapes:
+        println("area =", area(it))
+    println(classify(0), classify(5), classify(-2))

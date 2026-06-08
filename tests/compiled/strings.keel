@@ -1,0 +1,7 @@
+def main(sys: System); Io:
+    s = "Hello, Keel"
+    println(s.len(), s.upper(), s.lower())
+    println(s[0], s[0 -> 5], s.contains("Keel"), s.starts_with("Hello"))
+    parts = "a,b,c,d".split(",")
+    println(parts.len(), parts[2], parts.join("-"))
+    println(is_digit("7"), is_alpha("z"), ord("A"), chr(97))

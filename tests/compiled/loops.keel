@@ -1,0 +1,14 @@
+def main(sys: System); Io:
+    mut tot = 0
+    loop till tot >= 10; mut i = 0; i++:
+        tot = tot + i
+    println("accumulate until >=10:", tot)
+    nums = [3, 1, 4, 1, 5, 9, 2, 6]
+    mut s = 0
+    loop through nums:
+        s = s + it
+    println("sum =", s, "len =", nums.len())
+    mut rev = ""
+    loop till tot < 1; ; tot = tot - 1:
+        rev = rev + str(tot)
+    println("countdown =", rev)

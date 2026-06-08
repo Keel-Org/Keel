@@ -1,0 +1,4 @@
+def main(sys: System); Io:
+    user = "untrusted"
+    q = sql"SELECT 1" + user
+    println(q)

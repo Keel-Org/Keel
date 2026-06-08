@@ -1,184 +1,239 @@
-# Keel — Stage-0 Reference Interpreter: Design Notes
+# Keel — Design Notes (Part I)
 
-This document describes the implementation in `src/keel.c`: a single-file, tree-walking
-reference interpreter for the Keel language, written in C11. It follows the bootstrap plan
-in §9 of the specification — *the reference implementation brings the language up; the
-language is then rewritten in itself.* This interpreter is Stage 0: the oracle that the
-self-hosting toolchain is checked against.
+This document describes the implementation: a C11 reference interpreter, a
+self-hosting Keel→C compiler written in Keel, and the runtime they share. It
+follows the bootstrap plan in §9 of the specification — *the reference
+implementation brings the language up; the language is then rewritten in
+itself.* Part I reaches the point where that rewrite is real: Keel compiles
+Keel.
 
-The guiding principle, taken from the spec itself, is **honesty**. Where a feature is
-implemented faithfully, this document says so. Where the interpreter uses a runtime
-stand-in for something the real compiler would prove statically, it says that too, plainly,
-rather than pretending the demonstration is more than it is.
+The guiding principle, taken from the spec, is **honesty**. Where a feature is
+implemented faithfully, this document says so. Where the implementation uses a
+runtime stand-in for something the finished compiler will prove statically, it
+says that too, plainly.
 
-## What the interpreter is
+## What exists
 
-A complete pipeline that takes Keel source to observable behavior:
+    src/keel.c              Stage-0 reference interpreter (the oracle)
+    compiler/keelc.keel     the Keel→C compiler, written in Keel
+    runtime/keelrt.{h,c}    runtime that compiled Keel programs link against
+    runtime/keel_escape.h   the single-source context-string escapers (C5)
+    tests/                  conformance suite + behavioral-equivalence corpus
 
-    source → lexer → parser → AST → tree-walking evaluator
-                                  ↘ canonical formatter
-                                  ↘ property-based test runner
+The interpreter is invoked as `keel <run|test|fmt|tokens|ast|version> file`.
+The compiler reads a `.keel` file (through a filesystem capability) and emits C
+to standard output; `keelc-build.sh` drives it through `gcc`. Everything builds
+with `make` against libc and libm only.
 
-It is invoked as `keel <run|test|fmt|version> file.keel`. There are no external
-dependencies beyond libc and libm; it builds with `make`.
+## The two implementations and the runtime
+
+**Stage 0 — the interpreter (the oracle).** A tree-walking evaluator that is the
+definition of correct behavior. Source → lexer → parser → AST → evaluator, with
+a canonical formatter, a property-test runner, and token/AST dumps hanging off
+the AST.
+
+**The self-hosting compiler.** A complete Keel→C pipeline written in Keel:
+`source → lex → tokens → parse → AST → codegen → C`. Its parser's
+operator-precedence ladder matches the oracle's exactly; its code generator
+emits C against the runtime below. It is written in the same subset it compiles,
+which is what makes the bootstrap a genuine fixpoint rather than a demo.
+
+**The runtime.** The value representation and operations that compiled programs
+use. Each operation mirrors the interpreter's semantics, so a compiled binary is
+observably equivalent to `keel run`. The escapers live in one shared header so
+the interpreter and the runtime cannot diverge on the injection boundary.
 
 ## The pieces, and how honest each one is
 
 ### Lexer — faithful
 
-Significant indentation is tokenized into explicit `INDENT` / `DEDENT` / `NEWLINE` tokens
-using an indentation stack, with newlines suppressed inside brackets so multi-line
-expressions work. Numbers carry their kind through the lexer: an integer, a `decimal`
-(exact, when a `.` appears with no float suffix), or a float. Context-string tags are
-recognized by the lexer — `sql"..."`, `shell"..."`, `html"..."`, `url"..."` — so the
-*type* of a string literal is fixed at its first character, which is what makes the
-injection guarantee possible later. Interpolation (`#name`, `#{expr}`) is tokenized in
-place. This part of the implementation matches the spec's intent directly.
+Significant indentation becomes explicit `INDENT`/`DEDENT`/`NEWLINE` tokens via
+an indentation stack, with newlines suppressed inside brackets. Numbers carry
+their kind (integer, exact `decimal`, or float). Context-string tags
+(`sql"…"`, `shell"…"`, `html"…"`, `url"…"`) are recognized at the first
+character, which is what makes the typed-string guarantee possible. Diagnostics
+carry byte spans and stable codes; the lexer reports a caret excerpt for a stray
+character (`lex.char`) and recovers.
 
 ### Parser — faithful
 
-A precedence-climbing (Pratt) parser produces the AST. It handles the whole surface
-syntax exercised by the examples: `def` with return type after `;` and effects after `/`
-as `{Io, Fail<E>}`; `struct` / `enum` with payload-carrying variants; `derive (...)`;
-pattern matching with `check x: is Circle(r): ...`; the three loop forms
-(`loop`, `loop till cond; init; step:`, `loop through xs:`); `execute` / `handle` blocks;
-refinement types (`int where >= 0`); generics in both `[T]` and `<T>` forms; ternary,
-null-coalescing `??`, optional-chaining `?.`, and postfix `?` for try. Because Keel is
-expression-oriented, `execute`, `check`, and `if` are parsed in value position as well as
-statement position (e.g. `port = execute: ... handle Fail as e: resume 8080`).
+A precedence-climbing parser produces the AST for the whole surface syntax:
+`def` with a return type after `;` and effects in `{…}`; `struct`/`enum` with
+payload-carrying variants; `derive(…)`; `check`/`is` pattern matching; the three
+loop forms; `execute`/`handle`; refinement types (`int where >= 0`); generics;
+ternary, `??`, `?.`, and postfix `?`. Because Keel is expression-oriented,
+`execute`, `check`, and `if` parse in value position as well as statement
+position. Parse errors recover and report multiple independent diagnostics with
+the code `parse.error`.
+
+One known limitation, shared by both parsers: a *grouping* parenthesis whose
+`)` is immediately followed by a `:` (the end of an `if`/`loop`/`check` header)
+is misread as a lambda parameter list. It is always avoidable through precedence
+or a helper function, and is a candidate fix for Part II.
+
+### Diagnostics, panic, and the Fail taxonomy — faithful
+
+Errors recover where possible and are reported with spans, caret excerpts, and
+stable codes. The runtime distinguishes two failure kinds, and the distinction
+is load-bearing:
+
+- A **type error** — a violation the type system is meant to make impossible: a
+  plain string reaching a SQL sink (`type.sink`), an unknown method
+  (`type.method`), a missing field (`type.field`), an undefined name
+  (`name.undefined`). These are *uncatchable* aborts with exit code 70. Making
+  them recoverable would model an impossible condition as a runtime concern.
+- A **recoverable condition** — bad input, a missing file, a path escaping its
+  root. These are catchable `Fail` values that a handler can recover.
+
+The injection-sink rejection is uncatchable by design: a `Fail` handler cannot
+turn `db.run(plain_string)` into a recovery path.
 
 ### Algebraic effects — faithful mechanism, one-shot resumption
 
-This is the heart of the language and it is implemented as a real effect mechanism, not
-faked. It uses the classic `setjmp`/`longjmp` technique (the same approach behind libhandler
-and Leijen's "Implementing Algebraic Effects in C"): a dynamic stack of installed handlers,
-and a stack of perform-sites. Performing `Fail` searches outward for the nearest matching
-handler; running a handler clause can either fall off the end (which *aborts* to the
-`execute` site and yields the handler's value) or evaluate `resume v` (which `longjmp`s back
-to the perform site and continues the original computation with `v`). Both paths are
-demonstrated in `examples/03_effects.keel`: one handler resumes with a default port, the
-other aborts with a fallback value.
+A real effect mechanism using `setjmp`/`longjmp`: a dynamic stack of handlers
+and a stack of perform-sites. Performing `Fail` finds the nearest matching
+handler; a handler clause either falls off the end (aborting to the `execute`
+site with its value) or evaluates `resume v` (returning to the perform site).
+Resumptions are **one-shot and in-scope** — sufficient for the effects the spec
+leans on (`Fail`, condition/restart, `Io`); full multi-shot continuations are
+out of scope for Part I. The compiled runtime carries the same handler/boundary
+model, so each compiled function installs a `Fail` boundary exactly as the
+interpreter's call does.
 
-The honest limitation: resumptions are **one-shot and in-scope**. A handler may resume at
-most once, and only while its `execute` frame is still on the C stack. Full multi-shot
-continuations (resuming twice, or storing a continuation to call later) would require
-capturing and copying stack segments; that is out of scope for a Stage-0 interpreter. For
-the effects the spec leans on — `Fail`, condition/restart, `Io` — one-shot in-scope
-resumption is sufficient and behaves correctly.
+### Capability-based authority — faithful, with real containment
 
-`Io` is modeled as an ambient effect that simply runs: this is exactly the spec's
-"colorblind" claim (§3.4) — the same code is synchronous or asynchronous depending only on
-which handler `serve` installs — but the interpreter only ships the synchronous handler.
+`main(sys: System)` receives the one root capability; everything else is reached
+by narrowing it. Capabilities are ordinary values; a function not handed a `Db`
+cannot touch a database. Path containment is real: a requested path is
+canonicalized relative to the capability root, and any `..` segment that would
+escape the root is rejected — as a *catchable* `Fail`. File reads perform real
+I/O within the root (the compiler reads its own source this way). The database
+capability is still a test double whose `run` executes a tiny query engine over
+in-memory rows — enough to demonstrate the security properties without being a
+driver.
 
-### Capability-based authority — faithful in shape, runtime-enforced
+### Modules — faithful in shape, capability-honest
 
-`main(sys: System)` receives the one root capability; everything else is reachable only by
-narrowing it (`sys.fs.subtree("/var/log")`, `sys.net.database(...)`). Capabilities are
-ordinary values; a function that is not handed a `Db` cannot touch a database. Path
-traversal that escapes a capability's root is rejected — and rejected as a *catchable*
-`Fail`, so a handler can recover, which `examples/04_security.keel` shows. The shape of the
-model is faithful: authority flows by value, narrows monotonically, and is unforgeable
-from within safe code.
+Imports resolve relative to the importing file and bind the imported
+definitions. Import cycles are detected (`module.cycle`). Crucially, **no
+effectful code runs at import time**: a module may only declare definitions, and
+authority enters the program only at `main` (`module.toplevel` rejects top-level
+effects). Importing a module cannot, therefore, smuggle in authority.
 
-The stand-in: the filesystem and network capabilities don't perform real I/O. A `Db` is a
-test double whose `run` executes a deliberately tiny "query engine" (it reads the `id = N`
-out of the parameterized SQL and filters in-memory rows). This is enough to demonstrate the
-*security* properties end to end without pretending to be a database driver.
+### Context-typed strings — faithful (the real guarantee)
 
-### Context-typed strings — faithful (this is the real guarantee)
-
-`db.run(...)` accepts **only** a `sql"..."` value. Passing a plain `string` is rejected —
-in the interpreter, with an error; in the real compiler, it simply would not type-check.
-Either way the property is the same: *a string built from untrusted input cannot reach a
-SQL sink*, because a plain string is a different type from `sql""`, and concatenating
-untrusted data into a `sql""` is what the typed-string machinery exists to prevent.
-Interpolating a value into `sql"...#id..."` escapes it for the SQL context; the same
-interpolation into `html"..."` / `shell"..."` / `url"..."` escapes for *those* contexts.
-The injection class is closed structurally, not by discipline.
+`db.run(…)` accepts only a `sql"…"` value; a plain `string` is rejected.
+Interpolating into `sql"…#id…"` escapes for SQL; the same interpolation into
+`html`/`shell`/`url` escapes for those contexts. The escapers are defined once,
+in `runtime/keel_escape.h`, and included by both the interpreter and the
+compiled runtime — so "escape for SQL" has a single definition and the two
+implementations cannot drift. The injection class is closed structurally.
 
 ### Trust and secrets — faithful
 
-`Untrusted<T>` wraps network input; it cannot flow into a refined or plain target without
-passing through a validation boundary, which is where parsing happens (`raw.to_int()?`).
-Parsing untrusted input *is* the validation step, so the parsed, refined result is trusted.
-`Secret<T>` never renders its contents — it prints as `Secret(<redacted>)` everywhere
-except an explicit `reveal()`. Both are shown in the security and flagship examples.
+`Untrusted<T>` wraps network input and cannot flow into a refined or plain
+target without passing through a validation boundary (parsing *is* the
+validation). `Secret<T>` renders as `Secret(<redacted>)` everywhere except an
+explicit `reveal()`.
 
-### Refinement types — runtime checks, **not** an SMT proof
+### Refinement types — runtime checks, not an SMT proof
 
-This is the most important stand-in to be clear about. The spec (§3.8) describes refinements
-like `int where >= 0` as discharged by an SMT solver at compile time. **This interpreter
-does not run a solver.** It checks the predicate *at runtime* at the point of binding,
-construction, or validation, and fails if it does not hold. The observable behavior at the
-boundary is the same (a value that violates `where >= 0` is rejected), but it is a dynamic
-check, not a static proof, and it therefore cannot reject a bad program before it runs the
-way the real compiler would. Treat the refinement support here as an executable
-specification of *what* must hold, not as the mechanism that proves it.
+The most important stand-in. The spec discharges `int where >= 0` with an SMT
+solver at compile time. The implementation **checks the predicate at runtime**,
+at binding/construction/validation boundaries, and fails if it does not hold.
+The observable behavior at the boundary matches, but it is a dynamic check, not
+a static proof — it cannot reject a bad program before it runs. Part IV makes it
+static.
 
 ### Checked arithmetic & exact decimals — faithful
 
-Integer arithmetic uses the compiler's overflow-checked builtins and traps on overflow
-rather than wrapping silently (§5.4). `decimal` is implemented as an exact scaled integer:
-addition, subtraction, and multiplication are exact, and division extends precision. Arrays
-broadcast over scalars (`[1,2,3] * 10`), matching the array-computing goal of §3.10.
+Integer arithmetic traps on overflow rather than wrapping (the overflow-checked
+builtins live in the shared header, so the interpreter and compiled code trap at
+the same point). `decimal` is an exact scaled integer in the interpreter. Arrays
+broadcast over scalars.
 
 ### Memory model — deliberately not modeled at runtime
 
-Keel's headline claim is memory safety without a garbage collector, via ownership,
-borrowing, regions, and generational references (§4). A tree-walking interpreter has nothing
-to be safe *about* in that sense — it is itself written in C and uses a tracked arena that
-is freed at exit. So borrows (`&`, `&mut`) evaluate to the referent (identity at runtime),
-and `region`/`scope` blocks simply execute. The interpreter neither demonstrates nor
-violates the ownership system; that system is a compile-time discipline, and verifying it is
-a job for the type checker the self-hosting compiler will carry. This is stated plainly
-rather than papered over.
+Keel's memory safety without a garbage collector is a compile-time discipline
+(ownership, borrowing, regions, generational references). A tree-walker has
+nothing to be safe about in that sense; the compiled runtime uses a **tracked
+arena freed at exit** — the roadmap's explicitly time-boxed interim allocator.
+Borrows evaluate to the referent; `region`/`scope` blocks execute. The ownership
+system is the type checker's job, carried by the self-hosting compiler in a
+later part. Part IV replaces the arena with ownership-directed allocation.
 
-### Tests, including property tests with shrinking — faithful
+### Tests and the formatter — faithful
 
-`test "..."` and `test prop "..." (xs: array[int])` are first-class. The property runner
-generates random inputs by type, runs ~100 cases, and on failure **shrinks** the
-counterexample toward a minimal one. `examples/05_tests.keel` includes a deliberately false
-property; the runner finds it and shrinks the counterexample to `n=0`, the true boundary.
+`test` and `test prop` are first-class; the property runner generates inputs,
+runs ~100 cases, and shrinks counterexamples. `keel fmt` emits the one canonical
+layout and is idempotent (`fmt(fmt(x)) == fmt(x)`), checked by the conformance
+suite's property category.
 
-### The canonical formatter — faithful, and idempotent
+## The self-hosting compiler
 
-The spec mandates exactly one layout with no options (§3.14). `keel fmt` walks the AST and
-re-emits canonical Keel: 4-space indentation, normalized spacing, one true form. It is
-**idempotent** — `fmt(fmt(x)) == fmt(x)` for every example (checked by `make fmt-check`) —
-and semantics-preserving (format-then-run reproduces identical output).
+The compiler is the centerpiece of Part I. It targets **Keel-Core**, the
+self-hosting subset (see PART1.md for the full scope), and is written in that
+subset. Its design choices:
 
-### Not implemented
+- **Codegen targets the tagged-value runtime.** Each Keel function becomes a C
+  function returning the runtime's `kl` value type; each expression becomes a
+  runtime call. The semantics are exact; an unboxed, monomorphized
+  representation is Part IV's concern.
+- **Lexical scoping is mirrored with C scoping** plus a declare-on-first-binding
+  scope stack, so re-binding an outer mutable name is an update and loop-body
+  bindings are fresh per iteration.
+- **Output is deterministic** — ordered traversal and a monotonic gensym
+  counter, with no iteration over unordered structures — which is what lets the
+  bootstrap reach a byte-identical fixpoint.
 
-Honesty cuts both ways; these spec features are absent here. Content-addressed code (§3.16):
-not implemented. Comptime metaprogramming (§3.7): `comptime` blocks parse and simply
-evaluate; there is no staged compilation. The module/import system and FFI parse to no-ops.
-AOT compilation to native code (§3.11): there is none — this is an interpreter by design,
-since its job is to be the readable oracle, not the fast path.
+Two Keel-Core rules make the interpreter and compiled code agree: **parameters
+are immutable** (mutate via a `mut` local), and **names are not shadowed across
+nested blocks**. Both are stated and motivated in PART1.md.
 
-## The bootstrap story
+### Interpreter performance for self-hosting
 
-The reason this interpreter exists, per §9, is to bring the language far enough up that Keel
-can be written in Keel. `bootstrap/lexer.keel` is the first concrete link in that chain: **a
-lexer for Keel, written in Keel**, running on this C interpreter, tokenizing Keel source
-into keywords, identifiers, numbers, strings, and operators. It uses only language features
-the interpreter implements faithfully — structs, enums, pattern-friendly dispatch, string
-indexing and slicing, the character primitives, and loops — which is the point: the subset
-needed to describe the language's own front end is already real.
+Running a ~1300-line compiler on a tree-walker surfaced two quadratic costs that
+are now fixed, because they were real inefficiencies rather than inherent:
+arrays grow with amortized doubling (a capacity field), and each loop iteration
+gets a fresh scope so that re-binding an immutable name inside a loop no longer
+accumulates bindings in one environment. With these, the full bootstrap runs in
+about a second.
 
-A full self-hosting compiler extends exactly this approach through the parser, the type
-checker (where the refinement *solver* would finally appear for real), and a code generator.
-That is a much larger effort; what is demonstrated here is that the foundation is sound and
-the language is already expressive enough to begin describing itself — Stage 0 reaching
-toward Stage 1.
+## The bootstrap story — completed
+
+`make bootstrap` builds the chain and asserts the fixpoint:
+
+    Stage 0  bin/keel                       the C oracle
+    Stage 1  oracle runs keelc.keel  →  stage1.c → keelc1
+    Stage 2  keelc1 runs keelc.keel  →  stage2.c → keelc2
+    Stage 3  keelc2 runs keelc.keel  →  stage3.c
+
+The compiler is self-hosting because **`stage2.c == stage3.c`** byte for byte;
+additionally **`stage1.c == stage2.c`**, so the interpreter and the compiled
+compiler emit identical code. `make equiv` then cross-checks that programs in
+the Keel-Core corpus produce identical output whether interpreted by the oracle
+or compiled by `keelc` — with `keelc` running interpreted *and* as a native
+binary.
+
+## What is not implemented
+
+Content-addressed code (§3.16) and comptime metaprogramming (§3.7) are not
+realized (`comptime` parses and evaluates; there is no staged compilation). FFI
+parses to no-ops. The interpreter itself does no AOT compilation — that is the
+self-hosting compiler's job, and the parts of it that Part I delivers compile
+Keel-Core to native code via the runtime.
 
 ## Building and running
 
-    make            # build bin/keel
-    make examples   # run every example program
-    make test       # run the in-language unit + property test suites
-    make bootstrap  # run the Keel-in-Keel lexer
-    make fmt-check  # verify the formatter is idempotent on every example
+    make            # build bin/keel (the oracle)
+    make conform    # conformance suite (positive/negative/golden/property)
+    make bootstrap  # build the self-hosting chain, assert the fixpoint
+    make equiv      # oracle vs self-hosted-compiled equivalence
+    make all-checks # conform + bootstrap + equiv
+    make examples   # run every example
+    make test       # in-language unit + property tests
 
-    ./bin/keel run     examples/06_flagship.keel
-    ./bin/keel test    examples/05_tests.keel
-    ./bin/keel fmt     examples/02_types_match.keel
+    ./bin/keel run    examples/06_flagship.keel
+    ./bin/keel tokens examples/01_basics.keel
+    ./bin/keel ast    examples/01_basics.keel
+    ./keelc-build.sh  tests/compiled/recursion.keel /tmp/rec && /tmp/rec

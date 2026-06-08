@@ -1,0 +1,2 @@
+def main(sys: System); Io:
+    println(does_not_exist)

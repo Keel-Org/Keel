@@ -1,0 +1,5 @@
+token in logs: Secret(<redacted>)
+revealed only deliberately: hunter2
+narrowed capability root ok
+traversal blocked: path traversal rejected: escapes capability root
+response status: 404 body: no such user

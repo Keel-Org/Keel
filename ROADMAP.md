@@ -5,7 +5,7 @@ This document is the engineering roadmap for taking Keel from its current artifa
 that teams can rely on to build advanced systems across the whole stack. It is decision-level,
 not a task list: it says what is real, what is a stand-in, what is on the critical path, and —
 crucially — *why each choice is forced or free*, in the voice of `DESIGN.md` and the
-specification (`spec/README.md`).
+specification (`SPEC.md`).
 
 It is organized in two movements.
 

@@ -38,6 +38,11 @@
 #include <math.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <unistd.h>
+
+/* C5: the context-string escapers (the injection boundary) live in ONE place,
+ * shared verbatim with the runtime that compiled Keel programs link against. */
+#include "keel_escape.h"
 
 /* ------------------------------------------------------------------ memory */
 /* Stage-0 strategy: track every allocation, free all at process exit. The
@@ -94,6 +99,114 @@ static void vec_push(Vec *v, void *p){
     v->items[v->len++] = p;
 }
 
+/* ============================================================= source spans
+ * C1: a span is a first-class value — a file id plus a byte range [lo,hi) into
+ * that file's source. Line/column are computed lazily from a per-file table of
+ * line-start offsets, so a diagnostic can underline an entire sub-expression
+ * rather than point at a single column. Tokens and AST nodes both carry spans;
+ * the Keel-side compiler reproduces the same representation. */
+typedef struct {
+    char  *name;          /* interned file name */
+    char  *text;          /* full source (owned) */
+    int    len;
+    int   *line_starts;   /* byte offset of the first char on each 1-based line */
+    int    nlines;
+} SrcFile;
+
+#define MAX_SRC_FILES 256
+static SrcFile g_srcs[MAX_SRC_FILES];
+static int g_nsrcs = 0;
+
+typedef struct { int file_id; int lo; int hi; } Span;
+
+/* Register a source file, building its line-start table once. Returns file id. */
+static int src_register(const char *name, const char *text){
+    if (g_nsrcs >= MAX_SRC_FILES){ fprintf(stderr,"keel: too many source files\n"); exit(70); }
+    int id = g_nsrcs++;
+    SrcFile *f = &g_srcs[id];
+    f->name = xstrdup(name);
+    f->len  = (int)strlen(text);
+    f->text = xstrndup(text, f->len);
+    /* line_starts[1] = 0; one entry per line, plus sentinel */
+    Vec ls; vec_init(&ls);
+    vec_push(&ls, (void*)(intptr_t)0);              /* index 0 unused */
+    vec_push(&ls, (void*)(intptr_t)0);              /* line 1 starts at 0 */
+    for (int i = 0; i < f->len; i++)
+        if (f->text[i] == '\n') vec_push(&ls, (void*)(intptr_t)(i+1));
+    f->nlines = ls.len - 1;
+    f->line_starts = (int*)xalloc(sizeof(int)*ls.len);
+    for (int i = 0; i < ls.len; i++) f->line_starts[i] = (int)(intptr_t)ls.items[i];
+    return id;
+}
+
+/* Pure function: byte offset → (1-based line, 1-based column). */
+static void src_line_col(int file_id, int off, int *line, int *col){
+    SrcFile *f = &g_srcs[file_id];
+    int lo = 1, hi = f->nlines, ln = 1;
+    while (lo <= hi){
+        int mid = (lo+hi)/2;
+        if (f->line_starts[mid] <= off){ ln = mid; lo = mid+1; }
+        else hi = mid-1;
+    }
+    *line = ln;
+    *col  = off - f->line_starts[ln] + 1;
+}
+
+/* Render the offending source line with a caret/underline under [lo,hi). */
+static void src_render_excerpt(FILE *out, int file_id, int lo, int hi){
+    if (file_id < 0 || file_id >= g_nsrcs) return;
+    SrcFile *f = &g_srcs[file_id];
+    if (lo < 0) lo = 0; if (lo > f->len) lo = f->len;
+    if (hi < lo) hi = lo; if (hi > f->len) hi = f->len;
+    int line, col; src_line_col(file_id, lo, &line, &col);
+    int ls = f->line_starts[line];
+    int le = ls; while (le < f->len && f->text[le] != '\n') le++;
+    fprintf(out, "  %4d | %.*s\n", line, le-ls, f->text+ls);
+    fprintf(out, "       | ");
+    for (int i = 0; i < col-1; i++) fputc(' ', out);
+    int width = hi - lo; if (width < 1) width = 1;
+    if (lo + width > le) width = le - lo; if (width < 1) width = 1;
+    for (int i = 0; i < width; i++) fputc('^', out);
+    fputc('\n', out);
+}
+
+/* ----------------------------------------------------- diagnostics engine
+ * 1.1: errors are accumulated with a stable mnemonic CODE and a span, then
+ * rendered together with caret excerpts — never `exit()` on the first one.
+ * Negative conformance cases (C2) assert on the code, not the prose. */
+typedef struct { const char *code; int file_id; int lo; int hi; char *msg; } Diag;
+static Vec  g_diags;                 /* Diag* */
+static int  g_diag_cap_reached = 0;
+#define MAX_DIAGS 25
+
+static void diag_init(void){ vec_init(&g_diags); g_diag_cap_reached = 0; }
+
+static void diag_add(const char *code, int file_id, int lo, int hi, const char *fmt, ...){
+    if (g_diags.len >= MAX_DIAGS){ g_diag_cap_reached = 1; return; }
+    Diag *d = (Diag*)xalloc(sizeof(Diag));
+    d->code = code; d->file_id = file_id; d->lo = lo; d->hi = hi;
+    char tmp[512]; va_list ap; va_start(ap, fmt);
+    vsnprintf(tmp, sizeof tmp, fmt, ap); va_end(ap);
+    d->msg = xstrdup(tmp);
+    vec_push(&g_diags, d);
+}
+
+/* Print all accumulated diagnostics. Returns the number reported. */
+static int diag_flush(void){
+    for (int i = 0; i < g_diags.len; i++){
+        Diag *d = (Diag*)g_diags.items[i];
+        int line, col; 
+        if (d->file_id >= 0) src_line_col(d->file_id, d->lo, &line, &col);
+        else { line = 0; col = 0; }
+        const char *fname = d->file_id >= 0 ? g_srcs[d->file_id].name : "<input>";
+        fprintf(stderr, "%s:%d:%d: error[%s]: %s\n", fname, line, col, d->code, d->msg);
+        src_render_excerpt(stderr, d->file_id, d->lo, d->hi);
+    }
+    if (g_diag_cap_reached)
+        fprintf(stderr, "... (further errors suppressed; fix the above and re-run)\n");
+    return g_diags.len;
+}
+
 /* ================================================================== tokens */
 typedef enum {
     T_EOF, T_NEWLINE, T_INDENT, T_DEDENT,
@@ -121,6 +234,8 @@ typedef struct {
     const char *start;   /* into source */
     int len;
     int line;
+    int file_id;         /* C1: span — which source */
+    int lo, hi;          /* C1: span — byte range [lo,hi) into that source */
     char *strlit;        /* decoded string contents (with #interp markers) */
     char *tag;           /* context-string prefix, e.g. "sql"; or NULL */
 } Token;
@@ -130,6 +245,7 @@ typedef struct {
     const char *cur;
     int line;
     const char *filename;
+    int file_id;         /* C1 */
     /* indentation engine */
     int indents[256];
     int indent_top;
@@ -143,6 +259,9 @@ typedef struct {
 static Token *new_tok(Lexer *L, TokKind k, const char *s, int len){
     Token *t = (Token*)xalloc(sizeof(Token));
     t->kind=k; t->start=s; t->len=len; t->line=L->line; t->strlit=NULL; t->tag=NULL;
+    t->file_id = L->file_id;
+    t->lo = (int)(s - L->src);
+    t->hi = t->lo + (len>0?len:0);
     return t;
 }
 
@@ -162,16 +281,26 @@ static KwEnt KEYWORDS[] = {
     {"unsafe",T_UNSAFE},{"where",T_WHERE},{NULL,0}
 };
 
-static void lex_error(Lexer *L, const char *msg){
-    fprintf(stderr, "%s:%d: lex error: %s\n", L->filename, L->line, msg);
-    exit(65);
+/* Stable lexer error codes (asserted by negative conformance cases). */
+#define E_LEX_CHAR    "lex.char"
+#define E_LEX_STRING  "lex.string"
+#define E_LEX_INDENT  "lex.indent"
+#define E_LEX_DEDENT  "lex.dedent"
+
+static jmp_buf g_lex_recover;
+static void lex_error(Lexer *L, const char *code, const char *msg){
+    int lo = (int)(L->cur - L->src);
+    diag_add(code, L->file_id, lo, lo+1, "%s", msg);
+    /* recover: discard the rest of the current line, then resynchronize */
+    while (*L->cur && *L->cur != '\n') L->cur++;
+    longjmp(g_lex_recover, 1);
 }
 
 /* Emit DEDENTs/INDENT according to a new line's indentation. */
 static void handle_indent(Lexer *L, int width){
     int top = L->indents[L->indent_top];
     if (width > top){
-        if (L->indent_top+1 >= 256) lex_error(L, "indentation too deep");
+        if (L->indent_top+1 >= 256) lex_error(L, E_LEX_INDENT, "indentation too deep");
         L->indents[++L->indent_top] = width;
         vec_push(&L->tokens, new_tok(L, T_INDENT, L->cur, 0));
     } else if (width < top){
@@ -180,7 +309,7 @@ static void handle_indent(Lexer *L, int width){
             vec_push(&L->tokens, new_tok(L, T_DEDENT, L->cur, 0));
         }
         if (L->indents[L->indent_top] != width)
-            lex_error(L, "inconsistent dedent");
+            lex_error(L, E_LEX_DEDENT, "inconsistent dedent (does not match any open indentation level)");
     }
 }
 
@@ -215,7 +344,7 @@ static Token *scan_string(Lexer *L, char *tag){
             buf_putc(&b, *L->cur++);
         }
     }
-    if (*L->cur != '"') lex_error(L, "unterminated string");
+    if (*L->cur != '"') lex_error(L, E_LEX_STRING, "unterminated string literal");
     L->cur++; /* closing quote */
     Token *t = new_tok(L, T_STRING, start, (int)(L->cur-start));
     t->strlit = b.data;   /* decoded contents (with #interp markers intact) */
@@ -226,9 +355,17 @@ static Token *scan_string(Lexer *L, char *tag){
 static void lex(Lexer *L){
     L->indent_top = 0; L->indents[0] = 0;
     L->at_line_start = true; L->paren_depth = 0; L->line = 1;
-    bool any_token_on_line = false;
+    volatile bool any_token_on_line = false;
 
     while (*L->cur){
+        if (setjmp(g_lex_recover)){
+            /* a lex error skipped to end-of-line; resynchronize cleanly */
+            any_token_on_line = false;
+            L->paren_depth = 0;
+            if (*L->cur == '\n'){ L->cur++; L->line++; }
+            L->at_line_start = true;
+            continue;
+        }
         /* line-start: measure indentation (only when not inside brackets) */
         if (L->at_line_start && L->paren_depth == 0){
             const char *p = L->cur; int width = 0;
@@ -318,7 +455,7 @@ static void lex(Lexer *L){
             case '/': if(d=='=')TOK2(T_SLASHEQ); else TOK1(T_SLASH); break;
             case '%': if(d=='=')TOK2(T_PERCENTEQ); else TOK1(T_PERCENT); break;
             case '=': if(d=='=')TOK2(T_EQ); else TOK1(T_ASSIGN); break;
-            case '!': if(d=='=')TOK2(T_NE); else lex_error(L,"unexpected '!'"); break;
+            case '!': if(d=='=')TOK2(T_NE); else lex_error(L,E_LEX_CHAR,"unexpected '!' (did you mean '!='?)"); break;
             case '<': if(d=='=')TOK2(T_LE); else if(d=='<')TOK2(T_SHL); else TOK1(T_LT); break;
             case '>': if(d=='=')TOK2(T_GE); else if(d=='>')TOK2(T_SHR); else TOK1(T_GT); break;
             case '&':
@@ -332,7 +469,7 @@ static void lex(Lexer *L){
             case '~': TOK1(T_TILDE); break;
             case '?':
                 if(d=='.')TOK2(T_QDOT); else if(d=='?')TOK2(T_QQ); else TOK1(T_QUESTION); break;
-            default: { char m[64]; snprintf(m,sizeof m,"unexpected character '%c'(%d)",c,c); lex_error(L,m); }
+            default: { char m[64]; snprintf(m,sizeof m,"unexpected character '%c' (0x%02x)",isprint((unsigned char)c)?c:'?',(unsigned char)c); lex_error(L,E_LEX_CHAR,m); }
         }
         #undef ADV
         #undef TOK1
@@ -348,6 +485,17 @@ static void lex(Lexer *L){
 static Token **tokenize(const char *src, const char *filename, int *out_count){
     Lexer L; memset(&L,0,sizeof L);
     L.src=src; L.cur=src; L.filename=filename; vec_init(&L.tokens);
+    L.file_id = src_register(filename, src);
+    lex(&L);
+    *out_count = L.tokens.len;
+    return (Token**)L.tokens.items;
+}
+
+/* Variant used by the module loader / interp that already has a file id. */
+static Token **tokenize_in(const char *src, const char *filename, int file_id, int *out_count){
+    Lexer L; memset(&L,0,sizeof L);
+    L.src=src; L.cur=src; L.filename=filename; vec_init(&L.tokens);
+    L.file_id = file_id;
     lex(&L);
     *out_count = L.tokens.len;
     return (Token**)L.tokens.items;
@@ -373,6 +521,7 @@ typedef struct Node Node;
 struct Node {
     NodeKind kind;
     int line;
+    int file_id, lo, hi;   /* C1: span carried on every node for diagnostics */
     /* literals */
     int64_t ival;
     double  fval;
@@ -395,9 +544,13 @@ struct Node {
     Vec     effects;     /* char* effect names */
 };
 
+/* Set by the parser before each node() so AST nodes inherit the current span. */
+static int g_cur_file_id = 0, g_cur_lo = 0, g_cur_hi = 0;
+
 static Node *node(NodeKind k, int line){
     Node *n = (Node*)xalloc(sizeof(Node));
     n->kind=k; n->line=line;
+    n->file_id = g_cur_file_id; n->lo = g_cur_lo; n->hi = g_cur_hi;
     vec_init(&n->list); vec_init(&n->list2);
     vec_init(&n->derives); vec_init(&n->effects);
     return n;
@@ -411,25 +564,55 @@ static Node *node(NodeKind k, int line){
 typedef struct {
     Token **toks; int n; int pos;
     const char *filename;
+    int file_id;
 } Parser;
 
-static Token *pk(Parser *P){ return P->toks[P->pos]; }
+#define E_PARSE "parse.error"
+
+static jmp_buf g_parse_recover;
+static int g_parse_panicking = 0;   /* suppress cascade errors until we resync */
+
+static Token *pk(Parser *P){
+    Token *t = P->toks[P->pos];
+    /* feed the node() span hook so AST nodes inherit the current token's span */
+    g_cur_file_id = t->file_id; g_cur_lo = t->lo; g_cur_hi = t->hi>t->lo?t->hi:t->lo+1;
+    return t;
+}
 static Token *pk2(Parser *P){ return (P->pos+1<P->n)?P->toks[P->pos+1]:P->toks[P->n-1]; }
 static TokKind cur(Parser *P){ return pk(P)->kind; }
 static bool chk(Parser *P, TokKind k){ return cur(P)==k; }
 static Token *adv(Parser *P){ Token *t=pk(P); if(P->pos<P->n-1)P->pos++; return t; }
 static bool mtch(Parser *P, TokKind k){ if(chk(P,k)){adv(P);return true;} return false; }
 static void perr(Parser *P, const char *msg){
+    if (g_parse_panicking) longjmp(g_parse_recover, 1);   /* already recovering */
     Token *t=pk(P);
-    fprintf(stderr,"%s:%d: parse error: %s (near '%.*s')\n",
-        P->filename, t->line, msg, t->len>0?t->len:1, t->len>0?t->start:"?");
-    exit(65);
+    const char *near = t->len>0 ? t->start : "end of input";
+    int nlen = t->len>0 ? t->len : (int)strlen("end of input");
+    diag_add(E_PARSE, t->file_id, t->lo, t->hi>t->lo?t->hi:t->lo+1,
+             "%s (found '%.*s')", msg, nlen, near);
+    g_parse_panicking = 1;
+    longjmp(g_parse_recover, 1);
 }
 static Token *expect(Parser *P, TokKind k, const char *msg){
     if(!chk(P,k)) perr(P,msg); return adv(P);
 }
 static void skip_newlines(Parser *P){ while(chk(P,T_NEWLINE)) adv(P); }
 static char *tok_text(Token *t){ return xstrndup(t->start, t->len); }
+
+/* 1.1 recovery: discard tokens to the next statement boundary at the current or
+ * a shallower indentation, then resume — this bounds cascade errors without the
+ * bracket-counting that brace languages use. */
+static void parse_synchronize(Parser *P){
+    int depth = 0;
+    while (!chk(P, T_EOF)){
+        TokKind k = cur(P);
+        if (k == T_INDENT) depth++;
+        else if (k == T_DEDENT){ if (depth>0) depth--; else { adv(P); break; } }
+        else if (k == T_NEWLINE && depth == 0){ adv(P); break; }
+        adv(P);
+    }
+    g_parse_panicking = 0;
+}
 
 /* forward decls */
 static Node *parse_expr(Parser *P);
@@ -516,7 +699,7 @@ static Node *parse_string(Token *t){
                 while(i<n && depth>0){ if(s[i]=='{')depth++; else if(s[i]=='}'){depth--; if(!depth)break;} buf_putc(&ex,s[i]); i++; }
                 /* parse the embedded expression */
                 int cnt; Token **tt = tokenize(ex.data, "<interp>", &cnt);
-                Parser ip = {tt, cnt, 0, "<interp>"};
+                Parser ip = {tt, cnt, 0, "<interp>", (cnt>0?tt[0]->file_id:0)};
                 skip_newlines(&ip);
                 Node *e = parse_expr(&ip);
                 Node *holder = node(N_BLOCK, t->line); holder->a = e; holder->ival = 1; /* mark expr */
@@ -1246,8 +1429,12 @@ static Node *parse_decl_or_stmt(Parser *P){
         }
         case T_IMPORT:{
             adv(P); Node *im=node(N_IMPORT,line);
+            if(chk(P,T_STRING)){               /* import "rel/path.keel" */
+                Token *st=adv(P); im->sval=st->strlit?st->strlit:tok_text(st);
+                return im;
+            }
             Buf b; buf_init(&b);
-            buf_puts(&b, tok_text(expect(P,T_IDENT,"module name")));
+            buf_puts(&b, tok_text(expect(P,T_IDENT,"module name or quoted path")));
             while(mtch(P,T_DOT)){ buf_putc(&b,'.'); buf_puts(&b,tok_text(expect(P,T_IDENT,"name"))); }
             im->sval=xstrdup(b.data); return im;
         }
@@ -1267,11 +1454,19 @@ static Node *parse_decl_or_stmt(Parser *P){
 }
 
 static Node *parse_program(Token **toks, int n, const char *filename){
-    Parser P={toks,n,0,filename};
+    Parser P={toks,n,0,filename,0};
+    if (n>0) P.file_id = toks[0]->file_id;
     Node *prog=node(N_BLOCK,1);
     skip_newlines(&P);
     while(!chk(&P,T_EOF)){
-        vec_push(&prog->list, parse_decl_or_stmt(&P));
+        if (setjmp(g_parse_recover)){
+            /* a parse error fired; resynchronize to the next statement boundary */
+            parse_synchronize(&P);
+            skip_newlines(&P);
+            continue;
+        }
+        Node *d = parse_decl_or_stmt(&P);
+        if (d) vec_push(&prog->list, d);
         skip_newlines(&P);
     }
     return prog;
@@ -1297,7 +1492,7 @@ struct Value {
         bool b;
         struct { int64_t unscaled; int scale; } dec;
         struct { char *s; size_t len; } str;
-        struct { Value **items; int len; } arr;
+        struct { Value **items; int len; int cap; } arr;
         struct { char *type; Vec fields; } rec;       /* FieldVal* */
         struct { char *type; char *variant; Value **payload; int np; } en;
         struct { Node *fn; Env *env; } clo;
@@ -1323,7 +1518,7 @@ static Value *mkdec(int64_t u,int sc){ Value*v=mkval(V_DEC); v->as.dec.unscaled=
 static Value *mkctx(const char *ctx,const char *s){ Value*v=mkval(V_CTXSTR); v->as.ctxstr.ctx=xstrdup(ctx); v->as.ctxstr.s=xstrdup(s); return v; }
 static Value *mkok(Value *x){ Value*v=mkval(V_OK); v->as.inner=x; return v; }
 static Value *mkfail(Value *e){ Value*v=mkval(V_FAIL); v->as.inner=e; return v; }
-static Value *mkarr(Value **items,int n){ Value*v=mkval(V_ARRAY); v->as.arr.items=items; v->as.arr.len=n; return v; }
+static Value *mkarr(Value **items,int n){ Value*v=mkval(V_ARRAY); v->as.arr.items=items; v->as.arr.len=n; v->as.arr.cap=n; return v; }
 
 /* ----------------------------------------------------------------- environment */
 typedef struct Binding { char *name; Value *val; bool is_mut; struct Binding *next; } Binding;
@@ -1355,14 +1550,31 @@ static Node *find_enum_of_variant(const char *vname){
     return NULL;
 }
 
-/* ----------------------------------------------------- runtime error / panic */
+/* ----------------------------------------------------- runtime error / panic
+ * 1.3 taxonomy: a `panic` is the interpreter's stand-in for a *compile-time
+ * type error* — a violation the type system is meant to make impossible (a
+ * plain string reaching a SQL sink, an unknown method, an arity mismatch).
+ * These are uncatchable by design: making them recoverable would model an
+ * "impossible" condition as a runtime concern. A recoverable runtime condition
+ * (bad input, a missing file, a path that escapes its root) is a catchable
+ * `Fail` instead. Each abort carries a stable code so negative conformance
+ * cases assert on the code, and so the self-hosted checker knows which aborts
+ * become static rejections. */
 static jmp_buf g_panic_buf;
 static char g_panic_msg[512];
 static int g_panic_line;
+static char g_panic_code[64] = "runtime.panic";
+static const char *g_next_panic_code = NULL;   /* set just before a typed panic */
+
 static void panic(int line, const char *fmt, ...){
     va_list ap; va_start(ap,fmt); vsnprintf(g_panic_msg,sizeof g_panic_msg,fmt,ap); va_end(ap);
-    g_panic_line=line; longjmp(g_panic_buf,1);
+    g_panic_line=line;
+    snprintf(g_panic_code,sizeof g_panic_code,"%s", g_next_panic_code?g_next_panic_code:"runtime.panic");
+    g_next_panic_code=NULL;
+    longjmp(g_panic_buf,1);
 }
+/* tag the next panic with a specific type-error code */
+#define PANIC_CODE(c) (g_next_panic_code=(c))
 
 /* ------------------------------------------------- control-flow signals */
 typedef enum { CTL_NONE, CTL_RETURN, CTL_BREAK, CTL_CONTINUE } Ctl;
@@ -1838,6 +2050,39 @@ static Value *call_value(Value *callee, Value **args, int nargs, int line, Env *
     return VNONE;
 }
 
+/* 2.1 real path containment: canonicalize `req` *relative to* `root`, rejecting
+ * any `..` segment that would pop above the capability root. This both
+ * over-rejects nothing legitimate (a name merely containing ".." is fine) and
+ * under-rejects nothing dangerous (absolute escape, `foo/../../etc`, `.`-games).
+ * On escape it returns NULL; the caller raises a *catchable* Fail (1.3). */
+static char *path_contain(const char *root, const char *req){
+    /* split root into segments */
+    Vec seg; vec_init(&seg);
+    char *rcopy=xstrdup(root);
+    for(char *p=strtok(rcopy,"/"); p; p=strtok(NULL,"/")) vec_push(&seg,p);
+    int root_depth=seg.len;
+    /* walk requested segments relative to root; a leading '/' is treated as
+       relative to the capability root, never the real filesystem root */
+    char *qcopy=xstrdup(req);
+    for(char *p=strtok(qcopy,"/"); p; p=strtok(NULL,"/")){
+        if(strcmp(p,".")==0||p[0]==0) continue;
+        if(strcmp(p,"..")==0){
+            if(seg.len>root_depth) seg.len--;   /* pop inside the cap */
+            else return NULL;                   /* escape above the root */
+        } else vec_push(&seg,p);
+    }
+    Buf b; buf_init(&b);
+    if(root[0]=='/'||seg.len==0) buf_putc(&b,'/');
+    for(int i=0;i<seg.len;i++){ if(i)buf_putc(&b,'/'); buf_puts(&b,(char*)seg.items[i]); }
+    if(seg.len==0 && root[0]!='/') buf_puts(&b,".");
+    return b.data;
+}
+
+static Value *mk_cap(const char *type);
+static Value *record_get(Value *rec, const char *name);
+static void   record_set(Value *rec, const char *name, Value *v);
+static Value *perform_fail(Value *err, int line);
+
 /* capability + builtin-type method dispatch */
 static Value *cap_method(Value *recv, const char *method, Value **args, int nargs, int line){
     const char *t=recv->as.rec.type;
@@ -1845,30 +2090,42 @@ static Value *cap_method(Value *recv, const char *method, Value **args, int narg
         Value *rootv=record_get(recv,"root"); const char *root=rootv?rootv->as.str.s:"/";
         if(strcmp(method,"subtree")==0||strcmp(method,"path")==0){
             const char *p=args[0]->as.str.s;
-            if(strstr(p,".."))
+            char *resolved=path_contain(root,p);
+            if(!resolved)
                 return perform_fail(mkstr("path traversal rejected: escapes capability root"),line);
-            Buf b; buf_init(&b); buf_puts(&b,root);
-            if(b.len&&b.data[b.len-1]!='/') buf_putc(&b,'/');
-            buf_puts(&b,p);
-            Value *d=mk_cap("Dir"); record_set(d,"root",mkstr(b.data)); return d;
+            Value *d=mk_cap("Dir"); record_set(d,"root",mkstr(resolved)); return d;
         }
         if(strcmp(method,"open")==0){
             const char *p=args[0]->as.str.s;
-            if(strstr(p,".."))
-                return perform_fail(mkstr("path traversal rejected"),line);
-            Value *f=mk_cap("File"); record_set(f,"name",mkstr(p));
-            record_set(f,"content", nargs>1?args[1]:mkstr(""));
+            char *resolved=path_contain(root,p);
+            if(!resolved)
+                return perform_fail(mkstr("path traversal rejected: escapes capability root"),line);
+            Value *f=mk_cap("File"); record_set(f,"name",mkstr(resolved));
+            /* 2.1: real I/O — read actual bytes from disk within the cap root.
+               A test seed (second arg) overrides for hermetic conformance cases. */
+            if(nargs>1){ record_set(f,"content",args[1]); }
+            else {
+                FILE *fp=fopen(resolved,"rb");
+                if(!fp) return perform_fail(mkstr("no such file or unreadable within capability"),line);
+                fseek(fp,0,SEEK_END); long n=ftell(fp); fseek(fp,0,SEEK_SET);
+                char *buf=(char*)xalloc(n+1); size_t got=fread(buf,1,n,fp); buf[got]=0; fclose(fp);
+                record_set(f,"content",mkstr_n(buf,got));
+            }
             return mkok(f);
         }
+        if(strcmp(method,"root_path")==0){ return mkstr(root); }
     } else if(strcmp(t,"File")==0){
         if(strcmp(method,"read")==0){ Value *c=record_get(recv,"content"); return mkok(c?c:mkstr("")); }
+        if(strcmp(method,"name")==0){ Value *c=record_get(recv,"name"); return c?c:mkstr(""); }
     } else if(strcmp(t,"Net")==0){
         if(strcmp(method,"database")==0){ Value *db=mk_cap("Db"); record_set(db,"rows",mkarr(NULL,0)); record_set(db,"url",args[0]); return db; }
         if(strcmp(method,"listen")==0){ Value *l=mk_cap("Listener"); record_set(l,"port",args[0]); return l; }
     } else if(strcmp(t,"Db")==0){
         if(strcmp(method,"run")==0){
             if(nargs<1 || (args[0]->kind!=V_CTXSTR)){
-                panic(line,"db.run requires a parameterized `sql\"...\"` value, not a plain string (injection cannot type-check)");
+                PANIC_CODE("type.sink");
+                panic(line,"db.run requires a parameterized `sql\"...\"` value, not a plain string "
+                           "(injection cannot type-check)");
             }
             Value *rows=record_get(recv,"rows");
             if(!rows) return mkok(mkarr(NULL,0));
@@ -1896,29 +2153,20 @@ static Value *cap_method(Value *recv, const char *method, Value **args, int narg
     } else if(strcmp(t,"Scope")==0){
         if(strcmp(method,"spawn")==0) return VNONE;   /* structured task (run inline) */
     }
+    PANIC_CODE("type.method");
     panic(line,"no method `%s` on %s",method,t);
     return VNONE;
 }
 
 /* ===================================================================== eval */
 static void interp_escape(Buf *b, const char *ctx, Value *v){
-    /* context-aware escaping of interpolated data into a typed string */
+    /* context-aware escaping of interpolated data into a typed string —
+       delegated to the C5 single-source so `keel run` and compiled binaries
+       escape identically. */
     char *s = value_to_cstr(v,false);
-    if(strcmp(ctx,"sql")==0){
-        for(char *p=s;*p;p++){ if(*p=='\'') buf_puts(b,"''"); else buf_putc(b,*p); }
-    } else if(strcmp(ctx,"html")==0){
-        for(char *p=s;*p;p++){
-            switch(*p){ case '<':buf_puts(b,"&lt;");break; case '>':buf_puts(b,"&gt;");break;
-                case '&':buf_puts(b,"&amp;");break; case '"':buf_puts(b,"&quot;");break;
-                default: buf_putc(b,*p); }
-        }
-    } else if(strcmp(ctx,"shell")==0){
-        buf_putc(b,'\''); for(char *p=s;*p;p++){ if(*p=='\'') buf_puts(b,"'\\''"); else buf_putc(b,*p); } buf_putc(b,'\'');
-    } else if(strcmp(ctx,"url")==0){
-        for(char *p=s;*p;p++){ unsigned char c=*p;
-            if(isalnum(c)||c=='-'||c=='_'||c=='.'||c=='~') buf_putc(b,c);
-            else buf_printf(b,"%%%02X",c); }
-    } else buf_puts(b,s);
+    char *e = kesc_for(ctx, s);
+    buf_puts(b, e);
+    free(e);
 }
 
 static Value *eval_field(Node *n, Env *env){
@@ -1933,7 +2181,7 @@ static Value *eval_field(Node *n, Env *env){
         Value *f=record_get(recv,name);
         if(f) return f;
         /* method as bound value? fall through to none */
-        panic(n->line,"no field `%s` on %s",name,recv->as.rec.type[0]?recv->as.rec.type:"record");
+        PANIC_CODE("type.field"); panic(n->line,"no field `%s` on %s",name,recv->as.rec.type[0]?recv->as.rec.type:"record");
     }
     if(recv->kind==V_ENUM){
         /* access payload by index name not supported; expose .name */
@@ -1978,6 +2226,7 @@ static Value *eval(Node *n, Env *env){
             if(bd) return bd->val;
             if(find_type(n->sval)){ Value*t=mkval(V_TYPE); t->as.ty.name=n->sval; t->as.ty.decl=find_type(n->sval); return t; }
             if(find_enum_of_variant(n->sval)){ Value*e=mkval(V_ENUM); e->as.en.type=NULL; e->as.en.variant=n->sval; e->as.en.np=0; e->as.en.payload=NULL; return e; }
+            PANIC_CODE("name.undefined");
             panic(n->line,"undefined name `%s`",n->sval);
         }
         case N_ARRAY:{
@@ -2069,7 +2318,7 @@ static Value *eval(Node *n, Env *env){
                                 return call_closure(clo,args,nargs,n->line,"self",recv);
                             } }
                     }
-                    panic(n->line,"no method `%s` on %s",m,recv->as.rec.type);
+                    PANIC_CODE("type.method"); panic(n->line,"no method `%s` on %s",m,recv->as.rec.type);
                 }
                 /* primitive/builtin methods (arrays, strings, enums) */
                 return builtin_method(recv,m,args,nargs,n->line);
@@ -2214,7 +2463,7 @@ static Value *eval(Node *n, Env *env){
             Env *le=env_new(env);
             if(n->b) eval(n->b,le);                 /* init */
             while(!value_truthy(eval(n->a,le))){    /* loop until condition true */
-                eval_block(n->d,le);
+                eval_block(n->d, env_new(le));      /* fresh scope per iteration */
                 if(g_ctl==CTL_BREAK){ g_ctl=CTL_NONE; break; }
                 if(g_ctl==CTL_CONTINUE) g_ctl=CTL_NONE;
                 if(g_ctl==CTL_RETURN) break;
@@ -2238,7 +2487,7 @@ static Value *eval(Node *n, Env *env){
         }
         case N_LOOP_INF:{
             for(;;){
-                eval_block(n->a,env);
+                eval_block(n->a, env_new(env));     /* fresh scope per iteration */
                 if(g_ctl==CTL_BREAK){ g_ctl=CTL_NONE; break; }
                 if(g_ctl==CTL_CONTINUE) g_ctl=CTL_NONE;
                 if(g_ctl==CTL_RETURN) break;
@@ -2297,9 +2546,13 @@ static Value *eval_execute(Node *n, Env *env){
 
 /* ---------------------------------------------------- primitive methods */
 static Value *arr_push_inplace(Value *arr, Value *x){
-    Value **ni=(Value**)xalloc(sizeof(Value*)*(arr->as.arr.len+1));
-    for(int i=0;i<arr->as.arr.len;i++) ni[i]=arr->as.arr.items[i];
-    ni[arr->as.arr.len]=x; arr->as.arr.items=ni; arr->as.arr.len++;
+    if(arr->as.arr.len >= arr->as.arr.cap){
+        int nc = arr->as.arr.cap? arr->as.arr.cap*2 : 4;
+        Value **ni=(Value**)xalloc(sizeof(Value*)*nc);
+        for(int i=0;i<arr->as.arr.len;i++) ni[i]=arr->as.arr.items[i];
+        arr->as.arr.items=ni; arr->as.arr.cap=nc;
+    }
+    arr->as.arr.items[arr->as.arr.len]=x; arr->as.arr.len++;
     return arr;
 }
 static Value *builtin_method(Value *recv, const char *m, Value **args, int nargs, int line){
@@ -2319,7 +2572,7 @@ static Value *builtin_method(Value *recv, const char *m, Value **args, int nargs
         if(!strcmp(m,"each")){ for(int i=0;i<N;i++){ Value*a=it[i]; call_value(args[0],&a,1,line,NULL); } return VNONE; }
         if(!strcmp(m,"sum")){ Value*acc=mkint(0); for(int i=0;i<N;i++) acc=binop("+",acc,it[i],line); return acc; }
         if(!strcmp(m,"join")){ Buf b; buf_init(&b); const char*sep=nargs?args[0]->as.str.s:""; for(int i=0;i<N;i++){ if(i)buf_puts(&b,sep); char*s=value_to_cstr(it[i],false); buf_puts(&b,s);} return mkstr_n(b.data,b.len); }
-        panic(line,"no array method `%s`",m);
+        PANIC_CODE("type.method"); panic(line,"no array method `%s`",m);
     }
     if(recv->kind==V_STR){
         const char *s=recv->as.str.s; size_t L=recv->as.str.len;
@@ -2335,7 +2588,7 @@ static Value *builtin_method(Value *recv, const char *m, Value **args, int nargs
             if(sl==0){ for(size_t i=0;i<L;i++) vec_push(&parts,mkstr_n(s+i,1)); }
             else { while((q=strstr(p,sep))){ vec_push(&parts,mkstr_n(p,q-p)); p=q+sl; } vec_push(&parts,mkstr(p)); }
             Value**o=(Value**)xalloc(sizeof(Value*)*parts.len); for(int i=0;i<parts.len;i++)o[i]=parts.items[i]; return mkarr(o,parts.len); }
-        panic(line,"no string method `%s`",m);
+        PANIC_CODE("type.method"); panic(line,"no string method `%s`",m);
     }
     if(recv->kind==V_ENUM){
         if(!strcmp(m,"name")) return mkstr(recv->as.en.variant);
@@ -2344,7 +2597,7 @@ static Value *builtin_method(Value *recv, const char *m, Value **args, int nargs
         if(!strcmp(m,"abs")) return mkint(recv->as.i<0?-recv->as.i:recv->as.i);
         if(!strcmp(m,"to_f")) return mkfloat((double)recv->as.i);
     }
-    panic(line,"value has no method `%s`",m);
+    PANIC_CODE("type.method"); panic(line,"value has no method `%s`",m);
     return VNONE;
 }
 
@@ -2457,12 +2710,19 @@ static void register_builtins(Env *g){
 
 static Value *make_system(int argc, char **argv){
     Value *sys=mk_cap("System");
-    Value *fs=mk_cap("Dir"); record_set(fs,"root",mkstr("/"));
+    /* 2.1: root the filesystem capability at the real working directory, so the
+       one root authority handed to main(sys) can read actual files (e.g. the
+       compiler reading its own source) while narrowing stays containment-safe. */
+    char cwd[4096]; if(!getcwd(cwd,sizeof cwd)) strcpy(cwd,"/");
+    Value *fs=mk_cap("Dir"); record_set(fs,"root",mkstr(cwd));
     record_set(sys,"fs",fs);
     record_set(sys,"net",mk_cap("Net"));
-    int extra = argc>2? argc-2 : 0;
+    /* sys.args = user arguments AFTER `keel run script.keel` (argv[3..]),
+       matching the compiled runtime's argv[1..] so a program sees the same
+       args whether interpreted or compiled. */
+    int extra = argc>3? argc-3 : 0;
     Value **as = extra?(Value**)xalloc(sizeof(Value*)*extra):NULL;
-    for(int i=0;i<extra;i++) as[i]=mkstr(argv[i+2]);
+    for(int i=0;i<extra;i++) as[i]=mkstr(argv[i+3]);
     record_set(sys,"args",mkarr(as,extra));
     return sys;
 }
@@ -2488,7 +2748,7 @@ static int g_had_error=0;
 /* run top-level statements, then main(sys) if defined */
 static void run_program(Node *prog, Env *g, Value *sys){
     if(setjmp(g_panic_buf)){
-        fprintf(stderr,"runtime panic");
+        fprintf(stderr,"runtime error[%s]", g_panic_code);
         if(g_panic_line) fprintf(stderr," (line %d)",g_panic_line);
         fprintf(stderr,": %s\n",g_panic_msg); g_had_error=1; return;
     }
@@ -2555,7 +2815,7 @@ static void shrink(Node *body, Env *g, Vec *params, Value **args){
 }
 
 static int run_tests(Node *prog, Env *g){
-    int passed=0, failed=0;
+    volatile int passed=0, failed=0;
     for(int i=0;i<prog->list.len;i++){
         Node *t=(Node*)prog->list.items[i];
         if(t->kind!=N_TEST) continue;
@@ -2587,9 +2847,10 @@ static int run_tests(Node *prog, Env *g){
 
 /* ==================================================================== main */
 static char *read_file(const char *path){
-    FILE *f=fopen(path,"rb"); if(!f){ fprintf(stderr,"cannot open %s\n",path); exit(66); }
+    FILE *f=fopen(path,"rb"); if(!f){ fprintf(stderr,"keel: cannot open %s\n",path); exit(66); }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *buf=(char*)malloc(n+1); fread(buf,1,n,f); buf[n]=0; fclose(f); return buf;
+    char *buf=(char*)xalloc(n+1);
+    size_t got=fread(buf,1,n,f); buf[got]=0; fclose(f); return buf;
 }
 
 static void init_runtime(){
@@ -2598,26 +2859,70 @@ static void init_runtime(){
     vec_init(&g_types); vec_init(&g_variants);
 }
 
+/* The shared front-end: read → tokenize → parse → report. On any diagnostic,
+ * flush every accumulated error (with caret excerpts) and exit 65 — but only
+ * after the whole file has been scanned, never on the first error. */
+static Node *front_end(const char *path){
+    char *src=read_file(path);
+    int ntok; Token **toks=tokenize(src,path,&ntok);
+    Node *prog=parse_program(toks,ntok,path);
+    if (g_diags.len > 0){ diag_flush(); exit(65); }
+    return prog;
+}
+
+/* ------- C4: canonical token / AST dumps for differential testing ------- */
+static const char *tok_kind_name(TokKind k);
+static int dump_tokens_main(const char *path){
+    diag_init();
+    char *src=read_file(path);
+    int ntok; Token **toks=tokenize(src,path,&ntok);
+    if (g_diags.len > 0){ diag_flush(); return 65; }
+    for(int i=0;i<ntok;i++){
+        Token *t=toks[i];
+        Buf b; buf_init(&b);
+        for(int j=0;j<t->len;j++){ char c=t->start[j]; if(c=='\n')buf_puts(&b,"\\n"); else if(c=='\t')buf_puts(&b,"\\t"); else buf_putc(&b,c); }
+        printf("%-9s %d:%d", tok_kind_name(t->kind), t->lo, t->hi);
+        if(t->tag) printf(" tag=%s", t->tag);
+        if(t->len>0) printf(" '%s'", b.data);
+        printf("\n");
+    }
+    return 0;
+}
+
+static void ast_dump(Buf *b, Node *n, int depth);
+static int dump_ast_main(const char *path){
+    diag_init();
+    Node *prog=front_end(path);
+    Buf b; buf_init(&b);
+    for(int i=0;i<prog->list.len;i++){ ast_dump(&b,(Node*)prog->list.items[i],0); buf_putc(&b,'\n'); }
+    fputs(b.data,stdout);
+    return 0;
+}
+
 int format_main(const char *path);   /* formatter, defined below */
+static void load_imports(Node *prog, const char *base_path, Env *g);  /* 2.3 module loader */
 
 int main(int argc, char **argv){
     if(argc<2){
-        fprintf(stderr,"keel — reference interpreter for the Keel language\n");
-        fprintf(stderr,"usage: keel <run|test|fmt|version> [file.keel]\n");
+        fprintf(stderr,"keel — reference interpreter & oracle for the Keel language\n");
+        fprintf(stderr,"usage: keel <run|test|fmt|tokens|ast|version> [file.keel]\n");
         return 64;
     }
     const char *cmd=argv[1];
-    if(!strcmp(cmd,"version")){ printf("keel 0.1.0 (Stage-0 reference interpreter)\n"); return 0; }
+    if(!strcmp(cmd,"version")){ printf("keel 0.2.0 (Stage-0 reference oracle)\n"); return 0; }
     if(argc<3){ fprintf(stderr,"expected a .keel file\n"); return 64; }
-    if(!strcmp(cmd,"fmt")) return format_main(argv[2]);
 
-    char *src=read_file(argv[2]);
-    int ntok; Token **toks=tokenize(src,argv[2],&ntok);
-    Node *prog=parse_program(toks,ntok,argv[2]);
+    diag_init();
+    if(!strcmp(cmd,"fmt"))    return format_main(argv[2]);
+    if(!strcmp(cmd,"tokens")) return dump_tokens_main(argv[2]);
+    if(!strcmp(cmd,"ast"))    return dump_ast_main(argv[2]);
+
+    Node *prog=front_end(argv[2]);
 
     init_runtime();
     Env *g=env_new(NULL); g_genv=g;
     register_builtins(g);
+    load_imports(prog, argv[2], g);   /* 2.3: resolve and hoist imported modules */
     hoist(prog,g);
 
     if(!strcmp(cmd,"run")){
@@ -2635,10 +2940,157 @@ int main(int argc, char **argv){
     return 64;
 }
 
-/* =============================================================== formatter
- * Keel has exactly one canonical layout. The formatter re-emits the AST with
- * 4-space indentation and normalized spacing — there are no options.
- */
+/* ===================================================== C4: token/AST dumps */
+static const char *tok_kind_name(TokKind k){
+    switch(k){
+        case T_EOF:return "EOF"; case T_NEWLINE:return "NEWLINE";
+        case T_INDENT:return "INDENT"; case T_DEDENT:return "DEDENT";
+        case T_INT:return "INT"; case T_DECIMAL:return "DECIMAL"; case T_FLOAT:return "FLOAT";
+        case T_STRING:return "STRING"; case T_IDENT:return "IDENT";
+        case T_LPAREN:return "LPAREN"; case T_RPAREN:return "RPAREN";
+        case T_LBRACK:return "LBRACK"; case T_RBRACK:return "RBRACK";
+        case T_LBRACE:return "LBRACE"; case T_RBRACE:return "RBRACE";
+        case T_COMMA:return "COMMA"; case T_COLON:return "COLON"; case T_SEMI:return "SEMI"; case T_DOT:return "DOT";
+        case T_PLUS:return "PLUS"; case T_MINUS:return "MINUS"; case T_STAR:return "STAR";
+        case T_SLASH:return "SLASH"; case T_PERCENT:return "PERCENT"; case T_POW:return "POW";
+        case T_EQ:return "EQ"; case T_NE:return "NE"; case T_LT:return "LT"; case T_LE:return "LE";
+        case T_GT:return "GT"; case T_GE:return "GE";
+        case T_ASSIGN:return "ASSIGN"; case T_PLUSEQ:return "PLUSEQ"; case T_MINUSEQ:return "MINUSEQ";
+        case T_STAREQ:return "STAREQ"; case T_SLASHEQ:return "SLASHEQ"; case T_PERCENTEQ:return "PERCENTEQ";
+        case T_INC:return "INC"; case T_DEC:return "DEC";
+        case T_AMP:return "AMP"; case T_AMPMUT:return "AMPMUT"; case T_PIPE:return "PIPE";
+        case T_CARET:return "CARET"; case T_TILDE:return "TILDE"; case T_SHL:return "SHL"; case T_SHR:return "SHR";
+        case T_QUESTION:return "QUESTION"; case T_QDOT:return "QDOT"; case T_QQ:return "QQ"; case T_ARROW:return "ARROW";
+        case T_AND:return "AND"; case T_ASSERT:return "ASSERT"; case T_CHECK:return "CHECK"; case T_CLASS:return "CLASS";
+        case T_COMPTIME:return "COMPTIME"; case T_CONTINUE:return "CONTINUE"; case T_DEF:return "DEF"; case T_DERIVE:return "DERIVE";
+        case T_ELIF:return "ELIF"; case T_ELSE:return "ELSE"; case T_ENUM:return "ENUM"; case T_EXECUTE:return "EXECUTE";
+        case T_EXTERN:return "EXTERN"; case T_HANDLE:return "HANDLE"; case T_IF:return "IF"; case T_IMPORT:return "IMPORT";
+        case T_INTERFACE:return "INTERFACE"; case T_IS:return "IS"; case T_LOOP:return "LOOP"; case T_MODULE:return "MODULE";
+        case T_MUT:return "MUT"; case T_NONE:return "NONE"; case T_NOT:return "NOT"; case T_OR:return "OR"; case T_PARALLEL:return "PARALLEL";
+        case T_PRIVATE:return "PRIVATE"; case T_PROP:return "PROP"; case T_PUBLIC:return "PUBLIC"; case T_REGION:return "REGION";
+        case T_REFLECT:return "REFLECT"; case T_RESUME:return "RESUME"; case T_RETURN:return "RETURN"; case T_SCOPE:return "SCOPE";
+        case T_SHARED:return "SHARED"; case T_SPAWN:return "SPAWN"; case T_STRUCT:return "STRUCT"; case T_TEST:return "TEST";
+        case T_THROUGH:return "THROUGH"; case T_TILL:return "TILL"; case T_TOTAL:return "TOTAL"; case T_TYPE:return "TYPE";
+        case T_UNSAFE:return "UNSAFE"; case T_WHERE:return "WHERE"; case T_BREAK:return "BREAK"; case T_TRUE:return "TRUE"; case T_FALSE:return "FALSE";
+        default: return "?";
+    }
+}
+
+static const char *node_kind_name(NodeKind k){
+    switch(k){
+        case N_INT:return "int"; case N_DECIMAL:return "dec"; case N_FLOAT:return "float";
+        case N_STRING:return "str"; case N_BOOL:return "bool"; case N_NONE:return "none";
+        case N_IDENT:return "id"; case N_ARRAY:return "array"; case N_RECORD:return "record";
+        case N_INDEX:return "index"; case N_SLICE:return "slice"; case N_CALL:return "call"; case N_FIELD:return "field";
+        case N_UNARY:return "unary"; case N_BINARY:return "bin"; case N_LOGICAL:return "logical"; case N_TERNARY:return "ternary";
+        case N_QDOT:return "qdot"; case N_QQ:return "qq"; case N_TRY:return "try"; case N_RANGE:return "range";
+        case N_LAMBDA:return "lambda"; case N_INTERP:return "interp";
+        case N_LET:return "let"; case N_ASSIGN:return "assign"; case N_EXPRSTMT:return "expr"; case N_RETURN:return "return";
+        case N_IF:return "if"; case N_CHECK:return "check"; case N_LOOP_TILL:return "loop-till"; case N_LOOP_THROUGH:return "loop-through";
+        case N_LOOP_INF:return "loop"; case N_BREAK:return "break"; case N_CONTINUE:return "continue"; case N_ASSERT:return "assert";
+        case N_BLOCK:return "block"; case N_DEF:return "def"; case N_STRUCT:return "struct"; case N_ENUM:return "enum";
+        case N_INTERFACE:return "interface"; case N_CLASS:return "class"; case N_TEST:return "test"; case N_EXECUTE:return "execute";
+        case N_REGION:return "region"; case N_COMPTIME:return "comptime"; case N_IMPORT:return "import"; case N_MODULE:return "module";
+        case N_PARALLEL:return "parallel"; case N_UNSAFE:return "unsafe"; case N_EXTERN:return "extern";
+        case N_PARAM:return "param"; case N_FIELDDEF:return "fielddef"; case N_VARIANT:return "variant"; case N_ARM:return "arm";
+        case N_HANDLER:return "handler"; case N_TYPE:return "type"; case N_NAMEDARG:return "named";
+        default:return "?";
+    }
+}
+
+/* Compact, deterministic S-expression dump for differential testing (C4). */
+static void ast_dump(Buf *b, Node *n, int depth){
+    if(!n){ buf_puts(b,"()"); return; }
+    buf_putc(b,'(');
+    buf_puts(b, node_kind_name(n->kind));
+    switch(n->kind){
+        case N_INT: buf_printf(b," %lld",(long long)n->ival); break;
+        case N_FLOAT: buf_printf(b," %g",n->fval); break;
+        case N_BOOL: buf_printf(b," %s",n->bval?"true":"false"); break;
+        case N_STRING: buf_printf(b," %s", n->sval?n->sval:""); break;
+        case N_IDENT: buf_printf(b," %s", n->sval?n->sval:""); break;
+        case N_BINARY: case N_LOGICAL: case N_QQ: case N_RANGE:
+        case N_UNARY: case N_ASSIGN:
+            buf_printf(b," %s", n->sval?n->sval:""); break;
+        default: if(n->sval) buf_printf(b," %s",n->sval); break;
+    }
+    if(n->type){ buf_puts(b," :"); ast_dump(b,n->type,depth+1); }
+    if(n->a){ buf_putc(b,' '); ast_dump(b,n->a,depth+1); }
+    if(n->b){ buf_putc(b,' '); ast_dump(b,n->b,depth+1); }
+    if(n->c){ buf_putc(b,' '); ast_dump(b,n->c,depth+1); }
+    if(n->d){ buf_putc(b,' '); ast_dump(b,n->d,depth+1); }
+    for(int i=0;i<n->list.len;i++){ buf_putc(b,' '); ast_dump(b,(Node*)n->list.items[i],depth+1); }
+    if(n->list2.len){ buf_puts(b," |"); for(int i=0;i<n->list2.len;i++){ buf_putc(b,' '); ast_dump(b,(Node*)n->list2.items[i],depth+1); } }
+    buf_putc(b,')');
+}
+
+/* ============================================ 2.3: capability-honest modules
+ * `import "rel/path.keel"` (or `import name`) resolves a file relative to the
+ * importing file's directory, parses it, and hoists its top-level defs/types
+ * into the importing namespace. Imports bring NAMES, never AUTHORITY: the
+ * loaded module does not inherit any Dir/Net capability — capabilities only
+ * ever enter at `main(sys: System)` and flow by value. Import cycles are
+ * detected and reported, and modules may not run effectful top-level code. */
+static Vec g_loaded_modules;    /* char* absolute-ish paths already loaded */
+static Vec g_loading_stack;     /* char* for cycle detection */
+
+static char *dir_of(const char *path){
+    const char *slash=strrchr(path,'/');
+    if(!slash) return xstrdup(".");
+    return xstrndup(path,(size_t)(slash-path));
+}
+static char *join_path(const char *dir, const char *rel){
+    Buf b; buf_init(&b); buf_puts(&b,dir);
+    if(b.len && b.data[b.len-1]!='/') buf_putc(&b,'/');
+    buf_puts(&b,rel);
+    return b.data;
+}
+static int vec_has_str(Vec *v, const char *s){
+    for(int i=0;i<v->len;i++) if(strcmp((char*)v->items[i],s)==0) return 1; return 0;
+}
+
+static void hoist(Node *prog, Env *g);   /* fwd */
+
+static void load_imports(Node *prog, const char *base_path, Env *g){
+    char *base_dir = dir_of(base_path);
+    for(int i=0;i<prog->list.len;i++){
+        Node *d=(Node*)prog->list.items[i];
+        if(d->kind!=N_IMPORT) continue;
+        /* import target: either a quoted path, or dotted name → name.keel */
+        char *rel;
+        if(strstr(d->sval,".keel") || strchr(d->sval,'/')) rel=xstrdup(d->sval);
+        else { Buf nb; buf_init(&nb); buf_puts(&nb,d->sval); buf_puts(&nb,".keel"); rel=nb.data; }
+        char *full=join_path(base_dir,rel);
+
+        if(vec_has_str(&g_loading_stack, full)){
+            diag_add("module.cycle", d->file_id, d->lo, d->hi,
+                     "import cycle detected involving '%s'", rel);
+            diag_flush(); exit(65);
+        }
+        if(vec_has_str(&g_loaded_modules, full)) continue;   /* already loaded */
+
+        vec_push(&g_loading_stack, full);
+        Node *mod = front_end(full);                 /* read+parse the module */
+        /* a module may not run effectful top-level statements at load */
+        for(int j=0;j<mod->list.len;j++){
+            Node *s=(Node*)mod->list.items[j];
+            if(s->kind!=N_DEF&&s->kind!=N_STRUCT&&s->kind!=N_ENUM&&s->kind!=N_CLASS&&
+               s->kind!=N_INTERFACE&&s->kind!=N_TEST&&s->kind!=N_IMPORT&&s->kind!=N_MODULE&&
+               s->kind!=N_COMPTIME){
+                diag_add("module.toplevel", s->file_id, s->lo, s->hi,
+                         "a module may only declare definitions at top level "
+                         "(no effectful statements run at import — authority enters only at main)");
+                diag_flush(); exit(65);
+            }
+        }
+        load_imports(mod, full, g);                  /* nested imports first */
+        hoist(mod, g);                               /* bind NAMES (no authority) */
+        /* pop loading stack, mark loaded */
+        g_loading_stack.len--;
+        vec_push(&g_loaded_modules, full);
+    }
+}
+
 static void fmt_expr(Buf *b, Node *n);
 static void fmt_block(Buf *b, Node *blk, int ind);
 static void fmt_stmt(Buf *b, Node *n, int ind);

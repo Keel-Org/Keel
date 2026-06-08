@@ -1,0 +1,6 @@
+factorial(5) = 120
+fib(10) = 55
+hello from Keel
+doubled: [2, 4, 6, 8, 10]
+sum: 30
+broadcast [1,2,3] * 10 = [10, 20, 30]

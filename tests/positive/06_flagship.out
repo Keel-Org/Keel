@@ -1,0 +1,4 @@
+GET /user?id=2
+  -> 200 {"id":2,"name":"Alan"}
+GET /user?id=oops
+  -> 400 bad request

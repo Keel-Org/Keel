@@ -1,0 +1,16 @@
+def make_point(x: int, y: int); Point:
+    return {px: x, py: y}
+
+def dist2(p: Point); int:
+    return p.px * p.px + p.py * p.py
+
+def main(sys: System); Io:
+    mut p = make_point(3, 4)
+    println("dist2 =", dist2(p))
+    p.px = 6
+    println("after mutate:", dist2(p))
+    pts = [make_point(1, 1), make_point(2, 2)]
+    mut acc = 0
+    loop through pts:
+        acc = acc + dist2(it)
+    println("acc =", acc)
