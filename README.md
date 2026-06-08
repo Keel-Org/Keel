@@ -19,14 +19,13 @@ make conform    # the conformance suite (the executable specification)
 make bootstrap  # build the self-hosting chain and assert the fixpoint
 make equiv      # check the self-hosted compiler agrees with the interpreter
 make all-checks # conform + bootstrap + equiv
-make examples   # run every example program
-make test       # run the in-language unit + property test suites
+make test       # the integrated test runner (unit + property, with shrinking)
 
-./bin/keel run    examples/06_flagship.keel
-./bin/keel test   examples/05_tests.keel
-./bin/keel fmt    examples/02_types_match.keel
-./bin/keel tokens examples/01_basics.keel
-./bin/keel ast    examples/01_basics.keel
+./bin/keel run    tests/compiled/recursion.keel
+./bin/keel fmt    tests/compiled/strings.keel
+./bin/keel tokens tests/compiled/patterns.keel
+./bin/keel ast    tests/compiled/patterns.keel
+./bin/keel test   tests/property/05_tests.keel
 
 # compile a Keel program to a native binary with the Keel-written compiler
 ./keelc-build.sh tests/compiled/recursion.keel /tmp/rec && /tmp/rec
@@ -62,16 +61,15 @@ src/keel.c            the Stage-0 reference interpreter (C11, the oracle)
 compiler/keelc.keel   the Keel→C compiler, written in Keel (self-hosting)
 runtime/              keelrt.{h,c} (runtime for compiled programs) +
                       keel_escape.h (the single-source context-string escapers)
-examples/             01 basics · 02 types/match · 03 effects ·
-                      04 security · 05 tests · 06 flagship (spec Appendix B)
 tests/                conform.sh + equiv.sh, with positive/ negative/ golden/
                       property/ cases and the compiled/ equivalence corpus
 bootstrap.sh          build the self-hosting chain and assert the fixpoint
 keelc-build.sh        compile one .keel file to a native binary
 README.md             this file
+SPEC.md               the language design and specification
 DESIGN.md             implementation notes: faithful vs. stand-in, in detail
 PART1.md              the Part I self-hosting account
-Makefile              build · conform · bootstrap · equiv · examples · test
+Makefile              build · conform · bootstrap · equiv · all-checks · test
 ```
 
 ---

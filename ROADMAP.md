@@ -202,7 +202,7 @@ case categories, not one:
   Negative cases are where the language's guarantees actually live; a suite with only positive
   cases cannot certify that injection "cannot type-check."
 - **Property**: formatter idempotence (`fmt(fmt(x)) == fmt(x)`), format-then-run equivalence, and
-  parse-unparse-parse stability. `make fmt-check` already does the first; fold it in.
+  parse-unparse-parse stability. the conformance suite's property category already does the first; fold the rest in.
 - **Golden-AST / golden-token**: a canonical dump of the token stream and AST for each program,
   for differential testing (C4). These are the cases the Keel-side stages will be checked against.
 
@@ -283,7 +283,7 @@ input causes `exit()` before the whole file has been scanned for further errors.
 
 ### 1.2 The conformance harness (this is C2 — build it here)
 
-**Goal.** Turn `make examples` from "runs without crashing" into "produces exactly the expected
+**Goal.** Turn the positive conformance cases from "runs without crashing" into "produces exactly the expected
 observable behavior," across all four case categories.
 
 **Why here.** It locks behavior before the codebase grows, and — more importantly — it is the spec
@@ -394,7 +394,7 @@ serialization or, cheaply, by checking that `fmt` of both ASTs is byte-identical
 parser a continuous oracle for the Keel parser and turns "is my reimplementation correct?" from a
 manual review into a test.
 
-**Done means.** `parser.keel` parses every example and the bootstrap sources; its AST matches the C
+**Done means.** `parser.keel` parses the whole conformance corpus and the compiler sources; its AST matches the C
 parser's on the whole corpus under differential testing; the feature-backfill loop has driven any
 missing constructs into the interpreter, the suite, the formatter, and the differential tests.
 

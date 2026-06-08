@@ -1,3 +1,4 @@
-Logo/
-build/
-bin/
+/Logo/*
+/bin/
+/build/
+*.o

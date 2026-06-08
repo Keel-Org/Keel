@@ -230,10 +230,9 @@ Keel-Core to native code via the runtime.
     make bootstrap  # build the self-hosting chain, assert the fixpoint
     make equiv      # oracle vs self-hosted-compiled equivalence
     make all-checks # conform + bootstrap + equiv
-    make examples   # run every example
-    make test       # in-language unit + property tests
+    make test       # the integrated test runner (unit + property, shrinking)
 
-    ./bin/keel run    examples/06_flagship.keel
-    ./bin/keel tokens examples/01_basics.keel
-    ./bin/keel ast    examples/01_basics.keel
+    ./bin/keel run    tests/compiled/recursion.keel
+    ./bin/keel tokens tests/compiled/patterns.keel
+    ./bin/keel ast    tests/compiled/patterns.keel
     ./keelc-build.sh  tests/compiled/recursion.keel /tmp/rec && /tmp/rec

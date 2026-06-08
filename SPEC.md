@@ -26,8 +26,7 @@ retiring the two-language problem rather than living inside it.
 working implementation that is now self-hosting.** There is a **Stage-0 reference
 interpreter** in C — the oracle that defines correct behavior — and a **Keel→C compiler
 written in Keel** that compiles itself to a byte-identical fixpoint and agrees with the
-interpreter on a behavioral-equivalence corpus. The interpreter executes every example in
-`examples/`, formats Keel canonically, runs property tests with shrinking, enforces real
+interpreter on a behavioral-equivalence corpus. The interpreter runs the conformance and equivalence corpora, formats Keel canonically, runs property tests with shrinking, enforces real
 capability containment, and closes the injection class with a single shared escaper. A short,
 honest account of *what is realized today versus what is deferred to a later part* runs
 alongside each section and is consolidated in `DESIGN.md` and `PART1.md`.
@@ -189,8 +188,7 @@ and parallelize.
 *Interpreter: implemented as a genuine effect mechanism using the setjmp/longjmp
 handler-stack technique. Performing `Fail` searches outward for the nearest matching handler;
 a handler clause may fall off the end (aborting to the `execute` site with its value) or
-evaluate `resume v` (continuing the original computation). Both are shown in
-`examples/03_effects.keel`. The honest limit is that resumptions are one-shot and in-scope,
+evaluate `resume v` (continuing the original computation). Both are implemented and exercised by the test corpus. The honest limit is that resumptions are one-shot and in-scope,
 not multi-shot continuations — sufficient for `Fail`, condition/restart, and `Io`.*
 
 ### 3.4 Concurrency and async
@@ -229,7 +227,7 @@ converts an unhandled `Fail` into a propagating failure value.*
 **Resolution.** No null. Absence is `T?`, unusable as `T` until checked; `?.` accesses through
 it and `??` supplies a default. Null dereference ceases to exist as a category.
 
-*Interpreter: `T?`, `?.`, and `??` are implemented (see `examples/02_types_match.keel`).*
+*Interpreter: `T?`, `?.`, and `??` are implemented.*
 
 ### 3.7 Metaprogramming, generics, reflection, and derivation
 
@@ -279,8 +277,7 @@ def divide(a: int, b: int where != 0); int:
 ```
 
 *Interpreter: `test` and `test prop` are first-class; the property runner generates inputs by
-type, runs ~100 cases, and shrinks counterexamples (see `examples/05_tests.keel`, which finds
-a deliberately false property and minimizes it). Refinement types are the one important
+type, runs ~100 cases, and shrinks counterexamples, minimizing a deliberately false property to its boundary. Refinement types are the one important
 **stand-in**: predicates are checked **at runtime** at binding, construction, and validation
 boundaries, not discharged by an SMT solver — the observable rejection at the boundary
 matches, but it is a dynamic check, not a static proof. Fuzzing and the proof tier are not
@@ -351,7 +348,7 @@ arguments and whitespace fragility end. For longevity, **editions**: a module de
 edition, old editions compile forever, and editions interoperate.
 
 *Interpreter: the canonical formatter (`keel fmt`) is implemented and idempotent —
-`fmt(fmt(x)) == fmt(x)` for every example, verified by `make fmt-check` — and
+`fmt(fmt(x)) == fmt(x)`, verified by the conformance suite's property category — and
 semantics-preserving. Editions are not yet modeled.*
 
 ### 3.15 Undefined behavior
@@ -464,7 +461,7 @@ program *intent* remains the developer's responsibility.
 
 ## 6. A tour of the language (runnable)
 
-Each example below is in `examples/` and runs on the interpreter today.
+Each program below runs on the interpreter today.
 
 **Basics — checked arithmetic, ranges, higher-order functions, interpolation, broadcasting**
 (`01_basics.keel`):
@@ -667,7 +664,7 @@ struct  test  through  till  total  type  unsafe  where`
 
 A web request handler showing capabilities, effects (no `async`/`await`), context-typed
 queries, trust typing, refinement types, derivation, structured recovery, and an inline test —
-all in safe Keel with no garbage collector. The runnable version is `examples/06_flagship.keel`.
+all in safe Keel with no garbage collector. It runs on the interpreter today.
 
 ```keel
 derive (Eq, Json)
