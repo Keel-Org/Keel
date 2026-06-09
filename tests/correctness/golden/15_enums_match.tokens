@@ -1,0 +1,115 @@
+DERIVE    0:6 'derive'
+LPAREN    7:8 '('
+IDENT     8:10 'Eq'
+COMMA     10:11 ','
+IDENT     12:17 'Debug'
+RPAREN    17:18 ')'
+NEWLINE   19:19
+ENUM      19:23 'enum'
+IDENT     24:28 'Tree'
+COLON     28:29 ':'
+NEWLINE   30:30
+INDENT    34:34
+IDENT     34:38 'Leaf'
+LPAREN    38:39 '('
+IDENT     39:44 'value'
+COLON     44:45 ':'
+IDENT     46:49 'int'
+RPAREN    49:50 ')'
+NEWLINE   51:51
+IDENT     55:59 'Node'
+LPAREN    59:60 '('
+IDENT     60:64 'left'
+COLON     64:65 ':'
+IDENT     66:69 'int'
+COMMA     69:70 ','
+IDENT     71:76 'right'
+COLON     76:77 ':'
+IDENT     78:81 'int'
+RPAREN    81:82 ')'
+NEWLINE   83:83
+DEDENT    84:84
+DEF       84:87 'def'
+IDENT     88:93 'tally'
+LPAREN    93:94 '('
+IDENT     94:95 't'
+COLON     95:96 ':'
+IDENT     97:101 'Tree'
+RPAREN    101:102 ')'
+SEMI      102:103 ';'
+IDENT     104:107 'int'
+COLON     107:108 ':'
+NEWLINE   109:109
+INDENT    113:113
+CHECK     113:118 'check'
+IDENT     119:120 't'
+COLON     120:121 ':'
+NEWLINE   122:122
+INDENT    130:130
+IS        130:132 'is'
+IDENT     133:137 'Leaf'
+LPAREN    137:138 '('
+IDENT     138:139 'v'
+RPAREN    139:140 ')'
+COLON     140:141 ':'
+RETURN    142:148 'return'
+IDENT     149:150 'v'
+NEWLINE   151:151
+IS        159:161 'is'
+IDENT     162:166 'Node'
+LPAREN    166:167 '('
+IDENT     167:168 'l'
+COMMA     168:169 ','
+IDENT     170:171 'r'
+RPAREN    171:172 ')'
+COLON     172:173 ':'
+RETURN    174:180 'return'
+IDENT     181:182 'l'
+PLUS      183:184 '+'
+IDENT     185:186 'r'
+NEWLINE   187:187
+DEDENT    188:188
+DEDENT    188:188
+DEF       188:191 'def'
+IDENT     192:196 'main'
+LPAREN    196:197 '('
+IDENT     197:200 'sys'
+COLON     200:201 ':'
+IDENT     202:208 'System'
+RPAREN    208:209 ')'
+SEMI      209:210 ';'
+IDENT     211:213 'Io'
+COLON     213:214 ':'
+NEWLINE   215:215
+INDENT    219:219
+LOOP      219:223 'loop'
+THROUGH   224:231 'through'
+LBRACK    232:233 '['
+IDENT     233:237 'Leaf'
+LPAREN    237:238 '('
+INT       238:239 '5'
+RPAREN    239:240 ')'
+COMMA     240:241 ','
+IDENT     242:246 'Node'
+LPAREN    246:247 '('
+INT       247:248 '3'
+COMMA     248:249 ','
+INT       250:251 '4'
+RPAREN    251:252 ')'
+RBRACK    252:253 ']'
+COLON     253:254 ':'
+NEWLINE   255:255
+INDENT    263:263
+IDENT     263:270 'println'
+LPAREN    270:271 '('
+STRING    271:280 '"total ="'
+COMMA     280:281 ','
+IDENT     282:287 'tally'
+LPAREN    287:288 '('
+IDENT     288:290 'it'
+RPAREN    290:291 ')'
+RPAREN    291:292 ')'
+NEWLINE   293:293
+DEDENT    293:293
+DEDENT    293:293
+EOF       293:293

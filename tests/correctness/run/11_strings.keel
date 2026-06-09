@@ -1,0 +1,8 @@
+def main(sys: System); Io:
+    s = "Hello, Keel"
+    println(s.len(), s.upper(), s.lower())
+    println(s[0], s[0 -> 5], s.contains("Keel"), s.starts_with("Hello"))
+    println("  pad  ".trim(), "a,b,c".split(",").join("-"))
+    println(is_digit("7"), is_alpha("z"), is_alnum("a1"), is_space(" "))
+    println(ord("A"), chr(97), str(42), repr("x"))
+    println("count chars:", "banana".len())

@@ -1,0 +1,5 @@
+sql"name = 'Robert''); DROP TABLE students; --'"
+sql"v = 'a\\b''c'"
+html"<div>&lt;script&gt;alert(1)&lt;/script&gt;</div>"
+shell"echo '; rm -rf / #'"
+url"https://x/?q=a%20b%26c%3Dd%2Fe%3Ff"

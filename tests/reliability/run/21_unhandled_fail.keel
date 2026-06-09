@@ -1,0 +1,7 @@
+def boom(); int / {Fail}:
+    return fail("kaboom")
+
+def main(sys: System); Io:
+    println("before")
+    println(boom()?)
+    println("after (unreachable)")

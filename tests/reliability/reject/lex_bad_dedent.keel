@@ -1,0 +1,4 @@
+def main(sys: System); Io:
+    if true:
+        println("a")
+      println("b")

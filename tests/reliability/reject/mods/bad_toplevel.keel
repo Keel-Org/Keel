@@ -1,0 +1,3 @@
+println("I run at import time — forbidden")
+def helper(); int:
+    return 0

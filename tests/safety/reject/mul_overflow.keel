@@ -1,0 +1,2 @@
+def main(sys: System); Io:
+    println(9223372036854775807 * 2)

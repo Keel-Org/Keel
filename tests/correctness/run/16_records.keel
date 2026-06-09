@@ -1,0 +1,11 @@
+derive (Eq)
+struct Point:
+    x: int
+    y: int
+    label: string = "origin"
+
+def main(sys: System); Io:
+    p = Point(3, 4)
+    println(p.x, p.y, p.label)
+    q = Point(1, 2, "custom")
+    println(q.label)

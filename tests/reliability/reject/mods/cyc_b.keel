@@ -1,0 +1,3 @@
+import "cyc_a.keel"
+def b_fn(); int:
+    return 2

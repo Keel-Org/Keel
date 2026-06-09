@@ -9,6 +9,11 @@
 #include <stdarg.h>
 #include <math.h>
 #include <unistd.h>
+#include <limits.h>
+#include <sys/stat.h>
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 /* ----------------------------------------------------------------- arena */
 typedef struct KAlloc { struct KAlloc *next; } KAlloc;
@@ -184,20 +189,24 @@ kl kl_binop(const char *op, kl a, kl b){
         if(!strcmp(op,"+")){ if(kchk_add(x,y,&r))kl_panic("runtime.panic","integer overflow in +"); return kl_int(r); }
         if(!strcmp(op,"-")){ if(kchk_sub(x,y,&r))kl_panic("runtime.panic","integer overflow in -"); return kl_int(r); }
         if(!strcmp(op,"*")){ if(kchk_mul(x,y,&r))kl_panic("runtime.panic","integer overflow in *"); return kl_int(r); }
-        if(!strcmp(op,"/")){ if(y==0)kl_panic("runtime.panic","division by zero"); return kl_int(x/y); }
-        if(!strcmp(op,"%")){ if(y==0)kl_panic("runtime.panic","division by zero"); return kl_int(x%y); }
+        if(!strcmp(op,"/")){ if(y==0)kl_panic("runtime.panic","division by zero"); if(x==INT64_MIN&&y==-1)kl_panic("runtime.panic","integer overflow in /"); return kl_int(x/y); }
+        if(!strcmp(op,"%")){ if(y==0)kl_panic("runtime.panic","division by zero"); if(x==INT64_MIN&&y==-1)kl_panic("runtime.panic","integer overflow in %%"); return kl_int(x%y); }
         if(!strcmp(op,"**")){ int64_t rr=1; for(int64_t k=0;k<y;k++){ if(kchk_mul(rr,x,&rr))kl_panic("runtime.panic","overflow in **"); } return kl_int(rr); }
         if(!strcmp(op,"&"))return kl_int(x&y); if(!strcmp(op,"|"))return kl_int(x|y); if(!strcmp(op,"^"))return kl_int(x^y);
-        if(!strcmp(op,"<<"))return kl_int(x<<y); if(!strcmp(op,">>"))return kl_int(x>>y);
+        if(!strcmp(op,"<<")){ if(y<0||y>=64)kl_panic("runtime.panic","shift amount out of range [0,63]"); return kl_int((int64_t)((uint64_t)x<<y)); }
+        if(!strcmp(op,">>")){ if(y<0||y>=64)kl_panic("runtime.panic","shift amount out of range [0,63]"); return kl_int(x>>y); }
         if(!strcmp(op,"<"))return kl_bool(x<y); if(!strcmp(op,"<="))return kl_bool(x<=y);
         if(!strcmp(op,">"))return kl_bool(x>y); if(!strcmp(op,">="))return kl_bool(x>=y);
     }
     kl_panic("runtime.panic","unsupported operands for '%s'",op); return kl_none();
 }
-kl kl_neg(kl a){ if(a->kind==K_INT)return kl_int(-a->as.i); if(a->kind==K_FLOAT)return kl_float(-a->as.f); kl_panic("runtime.panic","cannot negate"); return kl_none(); }
+kl kl_neg(kl a){ if(a->kind==K_INT){ if(a->as.i==INT64_MIN)kl_panic("runtime.panic","integer overflow in negation"); return kl_int(-a->as.i); } if(a->kind==K_FLOAT)return kl_float(-a->as.f); kl_panic("runtime.panic","cannot negate"); return kl_none(); }
 kl kl_bnot(kl a){ if(a->kind==K_INT)return kl_int(~a->as.i); kl_panic("runtime.panic","~ requires int"); return kl_none(); }
 kl kl_qq(kl a, kl b){ return a->kind==K_NONE? b : a; }
-kl kl_range(kl lo, kl hi){ int64_t l=lo->as.i,h=hi->as.i; if(h<l)h=l; kl a=kl_arr_new(); for(int64_t i=l;i<h;i++) arr_push(a,kl_int(i)); return a; }
+kl kl_range(kl lo, kl hi){ int64_t l=lo->as.i,h=hi->as.i; if(h<l)h=l;
+    int64_t span; if(__builtin_sub_overflow(h,l,&span)||span<0) kl_panic("runtime.panic","invalid range bounds");
+    if((uint64_t)span > (uint64_t)(256u*1024u*1024u)/sizeof(void*)) kl_panic("runtime.panic","range too large (%lld elements)",(long long)span);
+    kl a=kl_arr_new(); for(int64_t i=l;i<h;i++) arr_push(a,kl_int(i)); return a; }
 
 /* ------------------------------------------------------------ index/field */
 kl kl_index(kl base, kl idx){
@@ -342,6 +351,36 @@ kl kl_builtin(const char *name, kl *a, int n){
 }
 
 /* ------------------------------------------------------------- methods */
+/* natural-order comparator for sort, via `<` semantics (mirrors the interpreter). */
+static int kl_sort_cmp(const void *p, const void *q){
+    kl a=*(kl const*)p, b=*(kl const*)q;
+    if(kl_truthy(kl_binop("<",a,b))) return -1;
+    if(kl_truthy(kl_binop("<",b,a))) return  1;
+    return 0;
+}
+/* Canonicalize an absolute path by resolving symlinks in its longest existing
+ * ancestor (realpath), re-appending the not-yet-existing tail lexically. Mirrors
+ * the interpreter so `keel run` and a compiled binary contain paths identically
+ * — the C5 single-behavior requirement applied to capability containment. */
+static char *kl_canon_existing(const char *abs){
+    char resolved[PATH_MAX];
+    char *work = kl_strndup(abs, strlen(abs));
+    char *tail[512]; int nt=0;
+    for(;;){
+        if(work[0]==0){ if(!getcwd(resolved,sizeof resolved)) strcpy(resolved,"/"); break; }
+        if(realpath(work, resolved)) break;
+        char *slash = strrchr(work,'/');
+        if(!slash){ if(nt<512) tail[nt++]=kl_strndup(work,strlen(work)); work[0]=0; continue; }
+        if(nt<512) tail[nt++]=kl_strndup(slash+1,strlen(slash+1));
+        if(slash==work) work[1]=0; else *slash=0;
+    }
+    kl_sb b; kl_sb_init(&b); sb_puts(&b,resolved);
+    for(int i=nt-1;i>=0;i--){
+        if(!(b.n==1 && b.p[0]=='/')) sb_puts(&b,"/");
+        sb_puts(&b,tail[i]);
+    }
+    return b.p;
+}
 kl kl_method(kl recv, const char *m, kl *a, int n){
     if(recv->kind==K_UNTRUSTED) recv=recv->as.inner;
     if(recv->kind==K_ARR){
@@ -355,6 +394,10 @@ kl kl_method(kl recv, const char *m, kl *a, int n){
         if(!strcmp(m,"reverse")){ kl o=kl_arr_new(); for(int i=N-1;i>=0;i--) arr_push(o,it[i]); return o; }
         if(!strcmp(m,"sum")){ kl acc=kl_int(0); for(int i=0;i<N;i++) acc=kl_binop("+",acc,it[i]); return acc; }
         if(!strcmp(m,"join")){ kl_sb b; kl_sb_init(&b); const char*sep=n?a[0]->as.str.s:""; for(int i=0;i<N;i++){ if(i)sb_puts(&b,sep); char*s=to_cstr(it[i],0); sb_puts(&b,s);} return kl_str_n(b.p,b.n); }
+        if(!strcmp(m,"sort")){ kl o=kl_arr_new(); for(int i=0;i<N;i++)arr_push(o,it[i]); if(N>1)qsort(o->as.arr.items,N,sizeof(kl),kl_sort_cmp); return o; }
+        if(!strcmp(m,"min")){ if(N==0)kl_panic("runtime.panic","min of empty array"); kl mn=it[0]; for(int i=1;i<N;i++) if(kl_truthy(kl_binop("<",it[i],mn)))mn=it[i]; return mn; }
+        if(!strcmp(m,"max")){ if(N==0)kl_panic("runtime.panic","max of empty array"); kl mx=it[0]; for(int i=1;i<N;i++) if(kl_truthy(kl_binop(">",it[i],mx)))mx=it[i]; return mx; }
+        if(!strcmp(m,"index_of")){ for(int i=0;i<N;i++) if(kl_eq(it[i],a[0])) return kl_int(i); return kl_int(-1); }
         kl_panic("type.method","no array method `%s`",m);
     }
     if(recv->kind==K_STR){
@@ -365,6 +408,11 @@ kl kl_method(kl recv, const char *m, kl *a, int n){
         if(!strcmp(m,"trim")){ int x=0,y=L; while(x<y&&isspace((unsigned char)s[x]))x++; while(y>x&&isspace((unsigned char)s[y-1]))y--; return kl_str_n(s+x,y-x); }
         if(!strcmp(m,"contains")) return kl_bool(strstr(s,a[0]->as.str.s)!=NULL);
         if(!strcmp(m,"starts_with")) return kl_bool(strncmp(s,a[0]->as.str.s,strlen(a[0]->as.str.s))==0);
+        if(!strcmp(m,"ends_with")){ int sl=a[0]->as.str.len; return kl_bool(sl<=L && memcmp(s+L-sl,a[0]->as.str.s,sl)==0); }
+        if(!strcmp(m,"index_of")){ const char*q=strstr(s,a[0]->as.str.s); return kl_int(q?(int64_t)(q-s):-1); }
+        if(!strcmp(m,"replace")){ const char*old=a[0]->as.str.s; int ol=(int)strlen(old); const char*neu=a[1]->as.str.s; kl_sb b; kl_sb_init(&b); if(ol==0){ sb_putn(&b,s,L); } else { const char*p=s,*q; while((q=strstr(p,old))){ sb_putn(&b,p,(int)(q-p)); sb_puts(&b,neu); p=q+ol; } sb_puts(&b,p); } return kl_str_n(b.p,b.n); }
+        if(!strcmp(m,"repeat")){ int64_t k=a[0]->as.i; if(k<0)kl_panic("runtime.panic","repeat count must be >= 0"); if(k!=0 && (size_t)L>(size_t)(256u*1024u*1024u)/(size_t)k) kl_panic("runtime.panic","repeat result too large"); kl_sb b; kl_sb_init(&b); for(int64_t i=0;i<k;i++) sb_putn(&b,s,L); return kl_str_n(b.p,b.n); }
+        if(!strcmp(m,"chars")){ kl o=kl_arr_new(); for(int i=0;i<L;i++) arr_push(o,kl_str_n(s+i,1)); return o; }
         if(!strcmp(m,"to_int")){ const char*p=s; while(*p&&isspace((unsigned char)*p))p++; if(!*p)return kl_fail(kl_str("empty input is not an integer")); char*end; long long v=strtoll(s,&end,10); while(*end&&isspace((unsigned char)*end))end++; if(*end)return kl_fail(kl_str("not an integer")); return kl_ok(kl_int(v)); }
         if(!strcmp(m,"split")){ const char*sep=a[0]->as.str.s; kl o=kl_arr_new(); int sl=(int)strlen(sep); const char*p=s,*q;
             if(sl==0){ for(int i=0;i<L;i++) arr_push(o,kl_str_n(s+i,1)); }
@@ -379,13 +427,21 @@ kl kl_method(kl recv, const char *m, kl *a, int n){
         if(!strcmp(t,"Dir")){
             kl rootv=kl_rec_get(recv,"root"); const char *root=rootv?rootv->as.str.s:".";
             if(!strcmp(m,"subtree")||!strcmp(m,"path")){
-                char *res=NULL; { /* path containment, mirrors the interpreter */
+                char *res=NULL; { /* layer 1: lexical containment, mirrors the interpreter */
                     const char *req=a[0]->as.str.s; int rootslash=root[0]=='/';
                     char *parts[256]; int np=0; char *rc=kl_strndup(root,strlen(root));
                     for(char*p=strtok(rc,"/");p&&np<256;p=strtok(NULL,"/")) parts[np++]=p;
                     int rd=np; char *qc=kl_strndup(req,strlen(req)); int esc=0;
                     for(char*p=strtok(qc,"/");p;p=strtok(NULL,"/")){ if(!strcmp(p,".")||!p[0])continue; if(!strcmp(p,"..")){ if(np>rd)np--; else {esc=1;break;} } else if(np<256) parts[np++]=p; }
                     if(!esc){ kl_sb b; kl_sb_init(&b); if(rootslash||np==0)sb_puts(&b,"/"); for(int i=0;i<np;i++){ if(i)sb_puts(&b,"/"); sb_puts(&b,parts[i]); } res=b.p; }
+                }
+                if(res){ /* layer 2: canonicalize (follow symlinks) and re-check containment */
+                    char *croot=kl_canon_existing(root[0]?root:".");
+                    char *ccand=kl_canon_existing(res);
+                    size_t rl=strlen(croot); int within;
+                    if(rl==1&&croot[0]=='/') within=(ccand[0]=='/');
+                    else within=(strncmp(ccand,croot,rl)==0 && (ccand[rl]=='/'||ccand[rl]==0));
+                    res = within ? ccand : NULL;
                 }
                 if(!res) return kl_perform_fail(kl_str("path traversal rejected: escapes capability root"));
                 kl d=kl_rec_new("Dir"); kl_rec_set(d,"root",kl_str(res)); return d;
@@ -399,7 +455,10 @@ kl kl_method(kl recv, const char *m, kl *a, int n){
                 kl f=kl_rec_new("File"); kl_rec_set(f,"name",kl_str(full));
                 if(n>1){ kl_rec_set(f,"content",a[1]); return kl_ok(f); }
                 FILE *fp=fopen(full,"rb"); if(!fp) return kl_perform_fail(kl_str("no such file or unreadable within capability"));
-                fseek(fp,0,SEEK_END); long sz=ftell(fp); fseek(fp,0,SEEK_SET); char *buf=(char*)kl_alloc(sz+1); size_t got=fread(buf,1,sz,fp); buf[got]=0; fclose(fp);
+                struct stat st;
+                if(fstat(fileno(fp),&st)!=0 || !S_ISREG(st.st_mode)){ fclose(fp); return kl_perform_fail(kl_str("not a regular file within capability")); }
+                if(st.st_size<0 || (uint64_t)st.st_size>(uint64_t)(1u<<31)){ fclose(fp); return kl_perform_fail(kl_str("file too large to read within capability")); }
+                size_t sz=(size_t)st.st_size; char *buf=(char*)kl_alloc(sz+1); size_t got=fread(buf,1,sz,fp); buf[got]=0; fclose(fp);
                 kl_rec_set(f,"content",kl_str_n(buf,(int)got)); (void)req; return kl_ok(f);
             }
         }

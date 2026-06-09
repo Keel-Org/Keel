@@ -1,0 +1,7 @@
+derive (Eq)
+struct Acct:
+    balance: int where >= 0
+
+def main(sys: System); Io:
+    a = Acct(-10)
+    println(a.balance)

@@ -104,13 +104,19 @@ interpreter's call does.
 
 `main(sys: System)` receives the one root capability; everything else is reached
 by narrowing it. Capabilities are ordinary values; a function not handed a `Db`
-cannot touch a database. Path containment is real: a requested path is
-canonicalized relative to the capability root, and any `..` segment that would
-escape the root is rejected — as a *catchable* `Fail`. File reads perform real
-I/O within the root (the compiler reads its own source this way). The database
-capability is still a test double whose `run` executes a tiny query engine over
-in-memory rows — enough to demonstrate the security properties without being a
-driver.
+cannot touch a database. Path containment is real and resolves symlinks: a
+requested path is resolved lexically against the capability root (rejecting any
+`..` that would pop above it), and then *canonicalized with `realpath`* — its
+longest existing ancestor is resolved through symlinks and the result is
+required to remain at or below the canonical root. This closes the symlink-escape
+hole that pure lexical checking leaves open (a link inside the root pointing
+outside it; cf. CWE-22/CWE-59), while a `..` escape and a symlink escape both
+surface as a *catchable* `Fail`. Reads are restricted to regular files of bounded
+size, so a directory or device handed to `open` fails cleanly rather than
+mis-sizing the read. File reads perform real I/O within the root (the compiler
+reads its own source this way). The database capability is still a test double
+whose `run` executes a tiny query engine over in-memory rows — enough to
+demonstrate the security properties without being a driver.
 
 ### Modules — faithful in shape, capability-honest
 
@@ -123,11 +129,15 @@ effects). Importing a module cannot, therefore, smuggle in authority.
 ### Context-typed strings — faithful (the real guarantee)
 
 `db.run(…)` accepts only a `sql"…"` value; a plain `string` is rejected.
-Interpolating into `sql"…#id…"` escapes for SQL; the same interpolation into
+Interpolating into `sql"…#id…"` escapes for SQL — doubling both the single quote
+*and* the backslash, so the escape holds on MySQL/MariaDB default mode as well as
+ANSI/standard-conforming dialects (quote-doubling alone is bypassable where a
+backslash can escape the closing quote; cf. CWE-89). The same interpolation into
 `html`/`shell`/`url` escapes for those contexts. The escapers are defined once,
 in `runtime/keel_escape.h`, and included by both the interpreter and the
 compiled runtime — so "escape for SQL" has a single definition and the two
-implementations cannot drift. The injection class is closed structurally.
+implementations cannot drift. The injection class is closed structurally; true
+parameter binding is the Part IV completion of the runtime escape.
 
 ### Trust and secrets — faithful
 
@@ -149,8 +159,25 @@ static.
 
 Integer arithmetic traps on overflow rather than wrapping (the overflow-checked
 builtins live in the shared header, so the interpreter and compiled code trap at
-the same point). `decimal` is an exact scaled integer in the interpreter. Arrays
-broadcast over scalars.
+the same point). The trap covers the easily-missed boundary cases too —
+`INT64_MIN / -1`, `INT64_MIN % -1`, and negating `INT64_MIN` would each be
+undefined behavior in C (a SIGFPE or a silent wrap), so each is checked and
+trapped instead. `decimal` is an exact scaled integer in the interpreter. Arrays
+broadcast over scalars, and `range`/`..` bound the materialized length so a
+pathological span fails cleanly instead of exhausting memory.
+
+### Robustness — no crash on hostile input
+
+A tree-walking interpreter recurses for nesting in its input, so deeply nested
+expressions or unbounded recursion could exhaust the C stack — a SIGSEGV, which
+is exactly the undefined behavior the language rules out in safe code. The lexer,
+parser, and evaluator therefore measure live C-stack usage against a fraction of
+the real `RLIMIT_STACK` and convert exhaustion into a clean diagnostic
+(`runtime.recursion`, or a recoverable parse error). Probing the stack pointer
+rather than a frame counter keeps the guard correct across the `longjmp`-based
+effect unwinding. (Under an AddressSanitizer build, run with
+`detect_stack_use_after_return=0`, since its heap "fake stack" defeats any
+stack-pointer probe.)
 
 ### Memory model — deliberately not modeled at runtime
 
@@ -166,8 +193,33 @@ later part. Part IV replaces the arena with ownership-directed allocation.
 
 `test` and `test prop` are first-class; the property runner generates inputs,
 runs ~100 cases, and shrinks counterexamples. `keel fmt` emits the one canonical
-layout and is idempotent (`fmt(fmt(x)) == fmt(x)`), checked by the conformance
-suite's property category.
+layout, is idempotent (`fmt(fmt(x)) == fmt(x)`), and is *semantics-preserving*:
+the conformance suite additionally requires `run(fmt(x)) == run(x)` for every
+positive program, so the formatter may not silently change a result (it preserves
+precedence parentheses, loop init/step clauses, and quoted import paths).
+
+The suite is the executable specification, and it is organized by the **quality
+goal** each test protects rather than by the mechanism that checks it, so a
+single scorecard answers "are we covered on security?" at a glance. `make check`
+runs every category and prints that scorecard. The categories: **correctness**
+(feature programs whose stdout/exit match, golden token/AST fixtures, and parse/
+type/name/refinement rejections each naming an error code); **safety** (the
+UB-class traps — overflow, division, `INT64_MIN` edges, bounds, recursion/nesting
+depth, range size, shift range — each rejected with a clean code); **security**
+(injection-sink rejection, trust/secret redaction, and capability containment
+over a *real* filesystem — symlink escape, `..` traversal, directory reads,
+absolute paths — checked on both the interpreter and native-compiled binaries);
+**reliability** (graceful rejection of malformed input — lexer edges, module
+cycle/top-level — and the unhandled-`Fail` taxonomy); **performance**
+(order-of-magnitude budgets that catch a complexity regression such as amortized
+array growth degrading to O(n²), plus guards-fail-fast assertions);
+**determinism** (the formatter is idempotent *and* semantics-preserving over
+every runnable program, every Keel-Core program is byte-identical interpreted vs
+compiled, and the self-hosting bootstrap reaches a fixpoint); and **tooling**
+(`fmt`/`tokens`/`ast` and the in-language `test` runner). `make harden`/`make
+fuzz` build under AddressSanitizer + UBSan and mutation-fuzz the front end; the
+corpus and the fuzzer run clean, which is the evidence behind the
+no-undefined-behavior claim.
 
 ## The self-hosting compiler
 
@@ -185,6 +237,13 @@ subset. Its design choices:
 - **Output is deterministic** — ordered traversal and a monotonic gensym
   counter, with no iteration over unordered structures — which is what lets the
   bootstrap reach a byte-identical fixpoint.
+- **The full operator set is in Keel-Core**, including the bitwise operators the
+  spec mandates (`& | ^ ~ << >>`): the lexer, the precedence table, and unary
+  `~` codegen all mirror the oracle, so a program using bit operations is
+  accepted and produces identical results whether interpreted or compiled.
+  Shifts trap a count outside `[0, 63]` and the left shift is computed on an
+  unsigned value, so there is no shift-related undefined behavior in either
+  implementation (per CERT INT34-C).
 
 Two Keel-Core rules make the interpreter and compiled code agree: **parameters
 are immutable** (mutate via a `mut` local), and **names are not shadowed across
@@ -226,13 +285,27 @@ Keel-Core to native code via the runtime.
 ## Building and running
 
     make            # build bin/keel (the oracle)
-    make conform    # conformance suite (positive/negative/golden/property)
-    make bootstrap  # build the self-hosting chain, assert the fixpoint
-    make equiv      # oracle vs self-hosted-compiled equivalence
-    make all-checks # conform + bootstrap + equiv
-    make test       # the integrated test runner (unit + property, shrinking)
+    make check      # whole suite, scored by quality goal (alias: all-checks)
 
-    ./bin/keel run    tests/compiled/recursion.keel
-    ./bin/keel tokens tests/compiled/patterns.keel
-    ./bin/keel ast    tests/compiled/patterns.keel
-    ./keelc-build.sh  tests/compiled/recursion.keel /tmp/rec && /tmp/rec
+The suite is organized by the quality goal each test protects, and `make check`
+prints a per-category scorecard so coverage is legible at a glance. Run one
+category in isolation with its name:
+
+    make correctness   # the language does what the spec says
+    make safety        # no undefined behavior in safe code (overflow/bounds/recursion)
+    make security      # capabilities, injection sinks, trust boundary (incl. compiled)
+    make reliability   # graceful handling of malformed input; the failure taxonomy
+    make performance   # complexity-regression budgets; guards fail fast
+    make determinism   # formatter idempotence+semantics; oracle≡compiled; bootstrap
+    make tooling       # fmt/tokens/ast and the in-language test runner
+
+    make bootstrap  # build the self-hosting chain, assert the fixpoint
+    make harden     # build + exercise the corpus under ASan/UBSan
+    make fuzz       # mutation-fuzz the front end under sanitizers
+    # (compatibility aliases: conform→correctness, equiv→determinism, perf→performance)
+
+    ./bin/keel run    tests/determinism/equiv/recursion.keel
+    ./bin/keel tokens tests/determinism/equiv/patterns.keel
+    ./bin/keel ast    tests/determinism/equiv/patterns.keel
+    ./keelc-build.sh  tests/determinism/equiv/recursion.keel /tmp/rec && /tmp/rec
+

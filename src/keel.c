@@ -39,12 +39,46 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 /* C5: the context-string escapers (the injection boundary) live in ONE place,
  * shared verbatim with the runtime that compiled Keel programs link against. */
 #include "keel_escape.h"
 
 /* ------------------------------------------------------------------ memory */
+/* ------------------------------------------------------------ stack guard
+ * Deeply nested input (a recursive program, or pathological grouping like
+ * "((((…))))") otherwise overflows the C stack and crashes with SIGSEGV —
+ * undefined behavior, which the language explicitly rules out in safe code.
+ * Instead we measure live C-stack usage against a fraction of the real
+ * RLIMIT_STACK and convert exhaustion into a clean diagnostic. Probing the
+ * stack pointer (rather than a counter) is immune to the longjmp-based effect
+ * unwinding, which would otherwise leave a frame counter corrupted. */
+static char  *g_stack_base  = NULL;
+static size_t g_stack_limit = 6u*1024u*1024u;   /* refined in main() */
+static size_t kstack_used(void){
+    char probe;
+    uintptr_t base=(uintptr_t)g_stack_base, cur=(uintptr_t)&probe;
+    return base>cur ? (size_t)(base-cur) : (size_t)(cur-base);
+}
+/* Establish the stack baseline and a safe budget (a fraction of the real
+ * RLIMIT_STACK) at startup, so deep recursion becomes a clean diagnostic rather
+ * than a SIGSEGV. Called once from main(), with the address of one of main()'s
+ * own locals as the baseline. */
+static void kstack_init(char *base){
+    g_stack_base = base;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl)==0 && rl.rlim_cur!=RLIM_INFINITY && rl.rlim_cur>0)
+        g_stack_limit = (size_t)(rl.rlim_cur / 4 * 3);   /* 75% of the real limit */
+    else
+        g_stack_limit = 6u*1024u*1024u;                  /* conservative fallback */
+    if (g_stack_limit < 1u*1024u*1024u) g_stack_limit = 1u*1024u*1024u;
+}
+
 /* Stage-0 strategy: track every allocation, free all at process exit. The
  * interpreter itself is C; the *language* it implements is GC-free. Programs
  * are short-lived, so this is leak-free at exit and avoids GC complexity. */
@@ -288,7 +322,7 @@ static KwEnt KEYWORDS[] = {
 #define E_LEX_DEDENT  "lex.dedent"
 
 static jmp_buf g_lex_recover;
-static void lex_error(Lexer *L, const char *code, const char *msg){
+_Noreturn static void lex_error(Lexer *L, const char *code, const char *msg){
     int lo = (int)(L->cur - L->src);
     diag_add(code, L->file_id, lo, lo+1, "%s", msg);
     /* recover: discard the rest of the current line, then resynchronize */
@@ -325,10 +359,17 @@ static TokKind ident_kind(const char *s, int len){
 static Token *scan_string(Lexer *L, char *tag){
     const char *start = L->cur;   /* at opening quote */
     L->cur++;                     /* skip " */
+    /* `"""` is not a supported multi-line string form; reject it cleanly rather
+     * than silently lexing it as an empty string followed by stray tokens. */
+    if (*L->cur=='"' && L->cur[1]=='"')
+        lex_error(L, E_LEX_STRING, "triple-quoted strings are not supported");
     Buf b; buf_init(&b);
     while (*L->cur && *L->cur != '"'){
         if (*L->cur == '\\'){
             char c = L->cur[1];
+            if (c == 0){            /* trailing backslash at end of input: */
+                break;              /* unterminated — let the check below report it */
+            }
             switch(c){
                 case 'n': buf_putc(&b,'\n'); break;
                 case 't': buf_putc(&b,'\t'); break;
@@ -398,6 +439,15 @@ static void lex(Lexer *L){
         /* numbers */
         if (isdigit((unsigned char)c)){
             const char *q = L->cur; bool isfloat=false, isdec=false;
+            /* hex (0x..) and binary (0b..) integer literals, underscores allowed */
+            if (c=='0' && (q[1]=='x'||q[1]=='X')){
+                q+=2; while (isxdigit((unsigned char)*q)||*q=='_') q++;
+                Token *t=new_tok(L,T_INT,s,(int)(q-s)); L->cur=q; vec_push(&L->tokens,t); continue;
+            }
+            if (c=='0' && (q[1]=='b'||q[1]=='B')){
+                q+=2; while (*q=='0'||*q=='1'||*q=='_') q++;
+                Token *t=new_tok(L,T_INT,s,(int)(q-s)); L->cur=q; vec_push(&L->tokens,t); continue;
+            }
             while (isdigit((unsigned char)*q)||*q=='_') q++;
             if (*q=='.' && isdigit((unsigned char)q[1])){
                 isdec=true; q++; while (isdigit((unsigned char)*q)||*q=='_') q++;
@@ -583,7 +633,7 @@ static TokKind cur(Parser *P){ return pk(P)->kind; }
 static bool chk(Parser *P, TokKind k){ return cur(P)==k; }
 static Token *adv(Parser *P){ Token *t=pk(P); if(P->pos<P->n-1)P->pos++; return t; }
 static bool mtch(Parser *P, TokKind k){ if(chk(P,k)){adv(P);return true;} return false; }
-static void perr(Parser *P, const char *msg){
+_Noreturn static void perr(Parser *P, const char *msg){
     if (g_parse_panicking) longjmp(g_parse_recover, 1);   /* already recovering */
     Token *t=pk(P);
     const char *near = t->len>0 ? t->start : "end of input";
@@ -741,11 +791,17 @@ static void parse_decimal_lit(const char *s, int len, int64_t *unscaled, int *sc
 }
 
 static Node *parse_primary(Parser *P){
+    if(g_stack_base && kstack_used() > g_stack_limit)
+        perr(P, "expression nesting too deep");
     Token *t = pk(P);
     switch(cur(P)){
         case T_INT: { adv(P); Node *n=node(N_INT,t->line);
             Buf b; buf_init(&b); for(int i=0;i<t->len;i++) if(t->start[i]!='_') buf_putc(&b,t->start[i]);
-            n->ival=strtoll(b.data,NULL,10); return n; }
+            const char *d=b.data;
+            if(d[0]=='0'&&(d[1]=='x'||d[1]=='X'))      n->ival=(int64_t)strtoull(d+2,NULL,16);
+            else if(d[0]=='0'&&(d[1]=='b'||d[1]=='B'))  n->ival=(int64_t)strtoull(d+2,NULL,2);
+            else                                        n->ival=strtoll(d,NULL,10);
+            return n; }
         case T_FLOAT:{ adv(P); Node *n=node(N_FLOAT,t->line);
             Buf b; buf_init(&b); for(int i=0;i<t->len;i++) if(t->start[i]!='_'&&t->start[i]!='f') buf_putc(&b,t->start[i]);
             n->fval=strtod(b.data,NULL); return n; }
@@ -915,6 +971,8 @@ static Node *parse_unary(Parser *P){
 }
 
 static Node *parse_binary(Parser *P, int min_prec){
+    if(g_stack_base && kstack_used() > g_stack_limit)
+        perr(P, "expression nesting too deep");
     Node *left=parse_unary(P);
     for(;;){
         TokKind k=cur(P);
@@ -1202,6 +1260,7 @@ static Node *parse_check(Parser *P){
         if(chk(P,T_IS)){
             adv(P);
             Node *arm=parse_pattern(P);
+            if(chk(P,T_IF)){ adv(P); arm->d=parse_expr(P); }   /* optional guard: is PATTERN if COND */
             expect(P,T_COLON,"expected ':'");
             arm->a=parse_block(P);
             vec_push(&ch->list,arm);
@@ -1431,6 +1490,7 @@ static Node *parse_decl_or_stmt(Parser *P){
             adv(P); Node *im=node(N_IMPORT,line);
             if(chk(P,T_STRING)){               /* import "rel/path.keel" */
                 Token *st=adv(P); im->sval=st->strlit?st->strlit:tok_text(st);
+                im->bval=true;                  /* remember it was a quoted path */
                 return im;
             }
             Buf b; buf_init(&b);
@@ -1566,7 +1626,7 @@ static int g_panic_line;
 static char g_panic_code[64] = "runtime.panic";
 static const char *g_next_panic_code = NULL;   /* set just before a typed panic */
 
-static void panic(int line, const char *fmt, ...){
+static _Noreturn void panic(int line, const char *fmt, ...){
     va_list ap; va_start(ap,fmt); vsnprintf(g_panic_msg,sizeof g_panic_msg,fmt,ap); va_end(ap);
     g_panic_line=line;
     snprintf(g_panic_code,sizeof g_panic_code,"%s", g_next_panic_code?g_next_panic_code:"runtime.panic");
@@ -1882,14 +1942,14 @@ static Value *binop(const char *op, Value *a, Value *b, int line){
         if(strcmp(op,"+")==0){ if(__builtin_add_overflow(x,y,&r)) panic(line,"integer overflow in %lld + %lld",(long long)x,(long long)y); return mkint(r); }
         if(strcmp(op,"-")==0){ if(__builtin_sub_overflow(x,y,&r)) panic(line,"integer overflow in %lld - %lld",(long long)x,(long long)y); return mkint(r); }
         if(strcmp(op,"*")==0){ if(__builtin_mul_overflow(x,y,&r)) panic(line,"integer overflow in %lld * %lld",(long long)x,(long long)y); return mkint(r); }
-        if(strcmp(op,"/")==0){ if(y==0)panic(line,"division by zero"); return mkint(x/y); }
-        if(strcmp(op,"%")==0){ if(y==0)panic(line,"division by zero"); return mkint(x%y); }
+        if(strcmp(op,"/")==0){ if(y==0)panic(line,"division by zero"); if(x==INT64_MIN&&y==-1)panic(line,"integer overflow in %lld / %lld",(long long)x,(long long)y); return mkint(x/y); }
+        if(strcmp(op,"%")==0){ if(y==0)panic(line,"division by zero"); if(x==INT64_MIN&&y==-1)panic(line,"integer overflow in %lld %% %lld",(long long)x,(long long)y); return mkint(x%y); }
         if(strcmp(op,"**")==0){ int64_t rr=1; for(int64_t k=0;k<y;k++){ if(__builtin_mul_overflow(rr,x,&rr)) panic(line,"integer overflow in exponentiation"); } return mkint(rr); }
         if(strcmp(op,"&")==0)return mkint(x&y);
         if(strcmp(op,"|")==0)return mkint(x|y);
         if(strcmp(op,"^")==0)return mkint(x^y);
-        if(strcmp(op,"<<")==0)return mkint(x<<y);
-        if(strcmp(op,">>")==0)return mkint(x>>y);
+        if(strcmp(op,"<<")==0){ if(y<0||y>=64)panic(line,"shift amount %lld out of range [0,63]",(long long)y); return mkint((int64_t)((uint64_t)x<<y)); }
+        if(strcmp(op,">>")==0){ if(y<0||y>=64)panic(line,"shift amount %lld out of range [0,63]",(long long)y); return mkint(x>>y); }
         if(strcmp(op,"<")==0)return mkbool(x<y);
         if(strcmp(op,"<=")==0)return mkbool(x<=y);
         if(strcmp(op,">")==0)return mkbool(x>y);
@@ -2050,19 +2110,49 @@ static Value *call_value(Value *callee, Value **args, int nargs, int line, Env *
     return VNONE;
 }
 
-/* 2.1 real path containment: canonicalize `req` *relative to* `root`, rejecting
- * any `..` segment that would pop above the capability root. This both
- * over-rejects nothing legitimate (a name merely containing ".." is fine) and
- * under-rejects nothing dangerous (absolute escape, `foo/../../etc`, `.`-games).
- * On escape it returns NULL; the caller raises a *catchable* Fail (1.3). */
+/* Canonicalize an absolute path by resolving symlinks in its longest existing
+ * ancestor with realpath(), then re-appending the not-yet-existing tail
+ * lexically. realpath() alone fails on paths whose final components do not yet
+ * exist (a subtree handle, a file about to be created), so we peel components
+ * until an ancestor resolves — at worst "/". This is what turns "is the lexical
+ * path inside the root" into "is the *real* path, after following symlinks,
+ * inside the root" (CWE-59 / CWE-22). */
+static char *canon_existing(const char *abs){
+    char resolved[PATH_MAX];
+    char *work = xstrdup(abs);
+    Vec tail; vec_init(&tail);                 /* peeled trailing segments, reversed */
+    for(;;){
+        if(work[0]==0){ if(!getcwd(resolved,sizeof resolved)) strcpy(resolved,"/"); break; }
+        if(realpath(work, resolved)) break;
+        char *slash = strrchr(work,'/');
+        if(!slash){ vec_push(&tail, xstrdup(work)); work[0]=0; continue; }
+        vec_push(&tail, xstrdup(slash+1));
+        if(slash==work) work[1]=0;             /* keep the leading root "/" */
+        else *slash=0;
+    }
+    Buf b; buf_init(&b); buf_puts(&b, resolved);
+    for(int i=tail.len-1;i>=0;i--){
+        if(!(b.len==1 && b.data[0]=='/')) buf_putc(&b,'/');
+        buf_puts(&b, (char*)tail.items[i]);
+    }
+    return b.data;
+}
+
+/* 2.1 real path containment. Two layers: (1) lexical resolution rejects any `..`
+ * that would pop above the root and any `.`-games (defense in depth); (2) the
+ * resolved candidate and the root are both canonicalized with realpath(),
+ * *following symlinks*, and the candidate is required to still be the root or a
+ * descendant of it. Layer 2 is what closes the symlink-escape hole that pure
+ * lexical resolution leaves open (a link inside the root pointing outside it).
+ * A leading '/' is treated as relative to the capability root, never the real
+ * filesystem root. On escape it returns NULL; the caller raises a catchable
+ * Fail (1.3). */
 static char *path_contain(const char *root, const char *req){
-    /* split root into segments */
+    /* layer 1: lexical resolution */
     Vec seg; vec_init(&seg);
     char *rcopy=xstrdup(root);
     for(char *p=strtok(rcopy,"/"); p; p=strtok(NULL,"/")) vec_push(&seg,p);
     int root_depth=seg.len;
-    /* walk requested segments relative to root; a leading '/' is treated as
-       relative to the capability root, never the real filesystem root */
     char *qcopy=xstrdup(req);
     for(char *p=strtok(qcopy,"/"); p; p=strtok(NULL,"/")){
         if(strcmp(p,".")==0||p[0]==0) continue;
@@ -2075,7 +2165,18 @@ static char *path_contain(const char *root, const char *req){
     if(root[0]=='/'||seg.len==0) buf_putc(&b,'/');
     for(int i=0;i<seg.len;i++){ if(i)buf_putc(&b,'/'); buf_puts(&b,(char*)seg.items[i]); }
     if(seg.len==0 && root[0]!='/') buf_puts(&b,".");
-    return b.data;
+    char *cand = b.data;
+
+    /* layer 2: canonicalize both sides (resolving symlinks) and require the
+       resolved candidate to remain within the resolved root. */
+    char *croot = canon_existing(root[0]?root:".");
+    char *ccand = canon_existing(cand);
+    size_t rl = strlen(croot);
+    int within;
+    if(rl==1 && croot[0]=='/') within = (ccand[0]=='/');         /* root is "/" */
+    else within = (strncmp(ccand,croot,rl)==0 && (ccand[rl]=='/'||ccand[rl]==0));
+    if(!within) return NULL;
+    return ccand;
 }
 
 static Value *mk_cap(const char *type);
@@ -2107,7 +2208,16 @@ static Value *cap_method(Value *recv, const char *method, Value **args, int narg
             else {
                 FILE *fp=fopen(resolved,"rb");
                 if(!fp) return perform_fail(mkstr("no such file or unreadable within capability"),line);
-                fseek(fp,0,SEEK_END); long n=ftell(fp); fseek(fp,0,SEEK_SET);
+                struct stat st;
+                if(fstat(fileno(fp),&st)!=0 || !S_ISREG(st.st_mode)){
+                    fclose(fp);
+                    return perform_fail(mkstr("not a regular file within capability"),line);
+                }
+                if(st.st_size < 0 || (uint64_t)st.st_size > (uint64_t)(1u<<31)){
+                    fclose(fp);
+                    return perform_fail(mkstr("file too large to read within capability"),line);
+                }
+                size_t n=(size_t)st.st_size;
                 char *buf=(char*)xalloc(n+1); size_t got=fread(buf,1,n,fp); buf[got]=0; fclose(fp);
                 record_set(f,"content",mkstr_n(buf,got));
             }
@@ -2200,6 +2310,10 @@ static Value *eval_field(Node *n, Env *env){
 
 static Value *eval(Node *n, Env *env){
     if(!n) return VNONE;
+    if(g_stack_base && kstack_used() > g_stack_limit){
+        PANIC_CODE("runtime.recursion");
+        panic(n->line, "recursion too deep: evaluation stack budget (%zu bytes) exhausted", g_stack_limit);
+    }
     switch(n->kind){
         case N_INT: return mkint(n->ival);
         case N_FLOAT: return mkfloat(n->fval);
@@ -2244,7 +2358,15 @@ static Value *eval(Node *n, Env *env){
             Value *a=eval(n->a,env),*b=eval(n->b,env);
             if(a->kind!=V_INT||b->kind!=V_INT) panic(n->line,"range bounds must be int");
             int64_t lo=a->as.i,hi=b->as.i; if(hi<lo)hi=lo;
-            int len=(int)(hi-lo); Value**items=len?(Value**)xalloc(sizeof(Value*)*len):NULL;
+            int64_t span;
+            if(__builtin_sub_overflow(hi,lo,&span) || span<0)
+                panic(n->line,"invalid range bounds");
+            /* bound the materialized array so a huge range can't truncate the
+               length (the old `(int)` cast) or exhaust memory; ~256MB of
+               element pointers is the ceiling. */
+            if((uint64_t)span > (uint64_t)(256u*1024u*1024u)/sizeof(Value*))
+                panic(n->line,"range too large (%lld elements)",(long long)span);
+            int len=(int)span; Value**items=len?(Value**)xalloc(sizeof(Value*)*(size_t)len):NULL;
             for(int i=0;i<len;i++) items[i]=mkint(lo+i);
             return mkarr(items,len);
         }
@@ -2360,7 +2482,7 @@ static Value *eval(Node *n, Env *env){
             }
             Value *v=eval(n->a,env);
             if(strcmp(n->sval,"not")==0) return mkbool(!value_truthy(v));
-            if(strcmp(n->sval,"-")==0){ if(v->kind==V_INT)return mkint(-v->as.i); if(v->kind==V_FLOAT)return mkfloat(-v->as.f); if(v->kind==V_DEC)return mkdec(-v->as.dec.unscaled,v->as.dec.scale); panic(n->line,"cannot negate"); }
+            if(strcmp(n->sval,"-")==0){ if(v->kind==V_INT){ if(v->as.i==INT64_MIN)panic(n->line,"integer overflow in negation of %lld",(long long)v->as.i); return mkint(-v->as.i); } if(v->kind==V_FLOAT)return mkfloat(-v->as.f); if(v->kind==V_DEC)return mkdec(-v->as.dec.unscaled,v->as.dec.scale); panic(n->line,"cannot negate"); }
             if(strcmp(n->sval,"~")==0){ if(v->kind==V_INT)return mkint(~v->as.i); panic(n->line,"~ requires int"); }
             if(strcmp(n->sval,"&")==0||strcmp(n->sval,"&mut")==0||strcmp(n->sval,"*")==0) return v; /* borrows are identity at runtime */
             panic(n->line,"unknown unary op %s",n->sval);
@@ -2455,7 +2577,10 @@ static Value *eval(Node *n, Env *env){
             for(int i=0;i<n->list.len;i++){
                 Node *arm=(Node*)n->list.items[i];
                 Env *ae=env_new(env);
-                if(match_pattern(arm,subj,ae)) return eval_block(arm->a,ae);
+                /* a structural match plus, if present, a guard that sees the
+                 * pattern's bindings; a failing guard falls through to the next arm. */
+                if(match_pattern(arm,subj,ae) && (!arm->d || value_truthy(eval(arm->d,ae))))
+                    return eval_block(arm->a,ae);
             }
             return VNONE;
         }
@@ -2473,7 +2598,20 @@ static Value *eval(Node *n, Env *env){
         }
         case N_LOOP_THROUGH:{
             Value *it=eval(n->a,env);
-            if(it->kind!=V_ARRAY) panic(n->line,"`loop through` requires an array");
+            if(it->kind==V_STR){
+                const char *s=it->as.str.s; size_t L=it->as.str.len;
+                for(size_t i=0;i<L;i++){
+                    Env *le=env_new(env);
+                    env_define(le,"it",mkstr_n(s+i,1),false);
+                    env_define(le,"i",mkint((int64_t)i),false);
+                    eval_block(n->b,le);
+                    if(g_ctl==CTL_BREAK){ g_ctl=CTL_NONE; break; }
+                    if(g_ctl==CTL_CONTINUE) g_ctl=CTL_NONE;
+                    if(g_ctl==CTL_RETURN) break;
+                }
+                return VNONE;
+            }
+            if(it->kind!=V_ARRAY) panic(n->line,"`loop through` requires an array or string");
             for(int i=0;i<it->as.arr.len;i++){
                 Env *le=env_new(env);
                 env_define(le,"it",it->as.arr.items[i],false);
@@ -2555,6 +2693,14 @@ static Value *arr_push_inplace(Value *arr, Value *x){
     arr->as.arr.items[arr->as.arr.len]=x; arr->as.arr.len++;
     return arr;
 }
+/* natural-order comparator for sort, via the existing `<` semantics (handles
+ * int/float/decimal/string); no capture needed since binop is a free function. */
+static int value_sort_cmp(const void *p, const void *q){
+    Value *a=*(Value*const*)p, *b=*(Value*const*)q;
+    if(value_truthy(binop("<",a,b,0))) return -1;
+    if(value_truthy(binop("<",b,a,0))) return  1;
+    return 0;
+}
 static Value *builtin_method(Value *recv, const char *m, Value **args, int nargs, int line){
     /* parsing untrusted input IS the validation step; methods see the inner value */
     if(recv->kind==V_UNTRUSTED) recv=recv->as.inner;
@@ -2572,6 +2718,11 @@ static Value *builtin_method(Value *recv, const char *m, Value **args, int nargs
         if(!strcmp(m,"each")){ for(int i=0;i<N;i++){ Value*a=it[i]; call_value(args[0],&a,1,line,NULL); } return VNONE; }
         if(!strcmp(m,"sum")){ Value*acc=mkint(0); for(int i=0;i<N;i++) acc=binop("+",acc,it[i],line); return acc; }
         if(!strcmp(m,"join")){ Buf b; buf_init(&b); const char*sep=nargs?args[0]->as.str.s:""; for(int i=0;i<N;i++){ if(i)buf_puts(&b,sep); char*s=value_to_cstr(it[i],false); buf_puts(&b,s);} return mkstr_n(b.data,b.len); }
+        if(!strcmp(m,"sort")){ Value**o=N?(Value**)xalloc(sizeof(Value*)*N):NULL; for(int i=0;i<N;i++)o[i]=it[i]; if(N>1)qsort(o,N,sizeof(Value*),value_sort_cmp); return mkarr(o,N); }
+        if(!strcmp(m,"reduce")){ if(nargs<2)panic(line,"reduce expects (initial, fn)"); Value*acc=args[0]; for(int i=0;i<N;i++){ Value*ab[2]={acc,it[i]}; acc=call_value(args[1],ab,2,line,NULL); } return acc; }
+        if(!strcmp(m,"min")){ if(N==0)panic(line,"min of empty array"); Value*mn=it[0]; for(int i=1;i<N;i++) if(value_truthy(binop("<",it[i],mn,line)))mn=it[i]; return mn; }
+        if(!strcmp(m,"max")){ if(N==0)panic(line,"max of empty array"); Value*mx=it[0]; for(int i=1;i<N;i++) if(value_truthy(binop(">",it[i],mx,line)))mx=it[i]; return mx; }
+        if(!strcmp(m,"index_of")){ for(int i=0;i<N;i++) if(values_equal(it[i],args[0])) return mkint(i); return mkint(-1); }
         PANIC_CODE("type.method"); panic(line,"no array method `%s`",m);
     }
     if(recv->kind==V_STR){
@@ -2582,6 +2733,11 @@ static Value *builtin_method(Value *recv, const char *m, Value **args, int nargs
         if(!strcmp(m,"trim")){ size_t a=0,b=L; while(a<b&&isspace((unsigned char)s[a]))a++; while(b>a&&isspace((unsigned char)s[b-1]))b--; return mkstr_n(s+a,b-a); }
         if(!strcmp(m,"contains")) return mkbool(strstr(s,args[0]->as.str.s)!=NULL);
         if(!strcmp(m,"starts_with")) return mkbool(strncmp(s,args[0]->as.str.s,strlen(args[0]->as.str.s))==0);
+        if(!strcmp(m,"ends_with")){ size_t sl=args[0]->as.str.len; return mkbool(sl<=L && memcmp(s+L-sl,args[0]->as.str.s,sl)==0); }
+        if(!strcmp(m,"index_of")){ const char*q=strstr(s,args[0]->as.str.s); return mkint(q? (int64_t)(q-s) : -1); }
+        if(!strcmp(m,"replace")){ const char*old=args[0]->as.str.s; size_t ol=strlen(old); const char*neu=args[1]->as.str.s; Buf b; buf_init(&b); if(ol==0){ buf_putn(&b,s,(int)L); } else { const char*p=s,*q; while((q=strstr(p,old))){ buf_putn(&b,p,(int)(q-p)); buf_puts(&b,neu); p=q+ol; } buf_puts(&b,p); } return mkstr_n(b.data,b.len); }
+        if(!strcmp(m,"repeat")){ int64_t k=args[0]->as.i; if(k<0)panic(line,"repeat count must be >= 0"); if(k!=0 && L>(size_t)(256u*1024u*1024u)/(size_t)k) panic(line,"repeat result too large"); Buf b; buf_init(&b); for(int64_t i=0;i<k;i++) buf_putn(&b,s,(int)L); return mkstr_n(b.data,b.len); }
+        if(!strcmp(m,"chars")){ Value**o=L?(Value**)xalloc(sizeof(Value*)*L):NULL; for(size_t i=0;i<L;i++)o[i]=mkstr_n(s+i,1); return mkarr(o,(int)L); }
         if(!strcmp(m,"to_int")){ const char*p=s; while(*p&&isspace((unsigned char)*p))p++; if(!*p) return mkfail(mkstr("empty input is not an integer")); char*end; long long v=strtoll(s,&end,10); while(*end&&isspace((unsigned char)*end))end++; if(*end) return mkfail(mkstr("not an integer")); return mkok(mkint(v)); }
         if(!strcmp(m,"split")){ const char*sep=args[0]->as.str.s; Vec parts; vec_init(&parts);
             const char*p=s; const char*q; size_t sl=strlen(sep);
@@ -2641,7 +2797,7 @@ static Value *bi_fail(Value**a,int n,Env*e){ (void)e; return mkfail(n? a[0]:VNON
 static Value *bi_secret(Value**a,int n,Env*e){ (void)e;(void)n; Value*v=mkval(V_SECRET); v->as.inner=a[0]; return v; }
 static Value *bi_reveal(Value**a,int n,Env*e){ (void)e;(void)n; Value*v=a[0]; return v->kind==V_SECRET? v->as.inner : v; }
 static Value *bi_untrusted(Value**a,int n,Env*e){ (void)e;(void)n; Value*v=mkval(V_UNTRUSTED); v->as.inner=a[0]; return v; }
-static Value *bi_range(Value**a,int n,Env*e){ (void)e; int64_t lo=0,hi; if(n==1){hi=a[0]->as.i;} else {lo=a[0]->as.i;hi=a[1]->as.i;} if(hi<lo)hi=lo; int len=(int)(hi-lo); Value**it=len?(Value**)xalloc(sizeof(Value*)*len):NULL; for(int i=0;i<len;i++)it[i]=mkint(lo+i); return mkarr(it,len); }
+static Value *bi_range(Value**a,int n,Env*e){ (void)e; int64_t lo=0,hi; if(n==1){hi=a[0]->as.i;} else {lo=a[0]->as.i;hi=a[1]->as.i;} if(hi<lo)hi=lo; int64_t span; if(__builtin_sub_overflow(hi,lo,&span)||span<0) panic(0,"invalid range bounds"); if((uint64_t)span > (uint64_t)(256u*1024u*1024u)/sizeof(Value*)) panic(0,"range too large (%lld elements)",(long long)span); int len=(int)span; Value**it=len?(Value**)xalloc(sizeof(Value*)*(size_t)len):NULL; for(int i=0;i<len;i++)it[i]=mkint(lo+i); return mkarr(it,len); }
 static Value *bi_abs(Value**a,int n,Env*e){ (void)e;(void)n; Value*v=a[0]; if(v->kind==V_INT)return mkint(v->as.i<0?-v->as.i:v->as.i); if(v->kind==V_FLOAT)return mkfloat(fabs(v->as.f)); return v; }
 static Value *bi_min(Value**a,int n,Env*e){ (void)e; Value*m=a[0]; for(int i=1;i<n;i++) if(value_truthy(binop("<",a[i],m,0)))m=a[i]; return m; }
 static Value *bi_max(Value**a,int n,Env*e){ (void)e; Value*m=a[0]; for(int i=1;i<n;i++) if(value_truthy(binop(">",a[i],m,0)))m=a[i]; return m; }
@@ -2848,7 +3004,10 @@ static int run_tests(Node *prog, Env *g){
 /* ==================================================================== main */
 static char *read_file(const char *path){
     FILE *f=fopen(path,"rb"); if(!f){ fprintf(stderr,"keel: cannot open %s\n",path); exit(66); }
-    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+    struct stat st;
+    if(fstat(fileno(f),&st)!=0 || !S_ISREG(st.st_mode)){ fprintf(stderr,"keel: not a regular file: %s\n",path); exit(66); }
+    if(st.st_size < 0 || (uint64_t)st.st_size > (uint64_t)(1u<<31)){ fprintf(stderr,"keel: file too large: %s\n",path); exit(66); }
+    size_t n=(size_t)st.st_size;
     char *buf=(char*)xalloc(n+1);
     size_t got=fread(buf,1,n,f); buf[got]=0; fclose(f); return buf;
 }
@@ -2903,6 +3062,7 @@ int format_main(const char *path);   /* formatter, defined below */
 static void load_imports(Node *prog, const char *base_path, Env *g);  /* 2.3 module loader */
 
 int main(int argc, char **argv){
+    char stack_anchor; kstack_init(&stack_anchor);
     if(argc<2){
         fprintf(stderr,"keel — reference interpreter & oracle for the Keel language\n");
         fprintf(stderr,"usage: keel <run|test|fmt|tokens|ast|version> [file.keel]\n");
@@ -3092,6 +3252,42 @@ static void load_imports(Node *prog, const char *base_path, Env *g){
 }
 
 static void fmt_expr(Buf *b, Node *n);
+/* Operator binding power for the formatter, mirroring the parser's infix_prec
+ * but keyed on the operator lexeme stored on the node. Used to decide when an
+ * operand must be parenthesized so the formatted text re-parses to the SAME
+ * tree — i.e. the formatter preserves meaning, not just shape. */
+static int fmt_op_prec(const char *op){
+    if(!strcmp(op,"or"))return 1;
+    if(!strcmp(op,"and"))return 2;
+    if(!strcmp(op,"??"))return 3;
+    if(!strcmp(op,"==")||!strcmp(op,"!=")||!strcmp(op,"<")||!strcmp(op,"<=")||!strcmp(op,">")||!strcmp(op,">="))return 4;
+    if(!strcmp(op,"->"))return 5;
+    if(!strcmp(op,"|"))return 6;
+    if(!strcmp(op,"^"))return 7;
+    if(!strcmp(op,"&"))return 8;
+    if(!strcmp(op,"<<")||!strcmp(op,">>"))return 9;
+    if(!strcmp(op,"+")||!strcmp(op,"-"))return 10;
+    if(!strcmp(op,"*")||!strcmp(op,"/")||!strcmp(op,"%"))return 11;
+    if(!strcmp(op,"**"))return 12;
+    return -1;
+}
+static int expr_prec(Node *n){
+    if(!n)return 100;
+    switch(n->kind){
+        case N_BINARY: case N_LOGICAL: case N_QQ: case N_RANGE: return fmt_op_prec(n->sval);
+        case N_TERNARY: return 0;   /* lowest: always parenthesize as an operand */
+        default: return 100;        /* literals/idents/calls/index/field/unary/try: atomic */
+    }
+}
+/* Format `child` as an operand of an infix op of precedence `parent_prec`.
+ * Wrap in parens exactly when omitting them would change the parse. */
+static void fmt_operand(Buf *b, Node *child, int parent_prec, bool is_right, bool parent_right_assoc){
+    int cp = expr_prec(child);
+    bool wrap = is_right ? (cp < parent_prec || (cp==parent_prec && !parent_right_assoc))
+                         : (cp < parent_prec || (cp==parent_prec &&  parent_right_assoc));
+    if(wrap){ buf_putc(b,'('); fmt_expr(b,child); buf_putc(b,')'); }
+    else fmt_expr(b,child);
+}
 static void fmt_block(Buf *b, Node *blk, int ind);
 static void fmt_stmt(Buf *b, Node *n, int ind);
 static void ind(Buf *b, int n){ for(int i=0;i<n*4;i++) buf_putc(b,' '); }
@@ -3141,8 +3337,10 @@ static void fmt_expr(Buf *b, Node *n){
             else if(!strcmp(n->sval,"not")){ buf_puts(b,"not "); fmt_expr(b,n->a); }
             else { buf_puts(b,n->sval); fmt_expr(b,n->a); }
             break;
-        case N_BINARY: case N_LOGICAL: case N_QQ: case N_RANGE:
-            fmt_expr(b,n->a); buf_printf(b," %s ",n->sval); fmt_expr(b,n->b); break;
+        case N_BINARY: case N_LOGICAL: case N_QQ: case N_RANGE:{
+            int P=fmt_op_prec(n->sval); bool ra=!strcmp(n->sval,"**");
+            fmt_operand(b,n->a,P,false,ra); buf_printf(b," %s ",n->sval); fmt_operand(b,n->b,P,true,ra);
+        } break;
         case N_TERNARY: fmt_expr(b,n->a); buf_puts(b," ? "); fmt_expr(b,n->b); buf_puts(b," : "); fmt_expr(b,n->c); break;
         case N_TRY: fmt_expr(b,n->a); buf_putc(b,'?'); break;
         case N_LAMBDA:{ buf_putc(b,'('); for(int i=0;i<n->list.len;i++){ Node*p=(Node*)n->list.items[i]; if(i)buf_puts(b,", "); buf_puts(b,p->sval); if(p->type){buf_puts(b,": ");fmt_type(b,p->type);} } buf_puts(b,"): "); fmt_expr(b,n->a); } break;
@@ -3164,6 +3362,28 @@ static void fmt_block(Buf *b, Node *blk, int indent){
     for(int i=0;i<blk->list.len;i++) fmt_stmt(b,(Node*)blk->list.items[i],indent);
 }
 
+/* Format a `loop till` init/step clause inline (no indent, no newline). These
+ * are declarations (N_LET, keeping `mut`) or assignments (including the postfix
+ * `i++`/`i--` step), and dropping either one silently changes the loop. */
+static void fmt_loop_clause(Buf *b, Node *s){
+    if(!s) return;
+    if(s->kind==N_LET){
+        if(s->is_mut) buf_puts(b,"mut ");
+        buf_puts(b,s->sval);
+        if(s->type){ buf_puts(b,": "); fmt_type(b,s->type); }
+        buf_puts(b," = "); fmt_expr(b,s->a);
+    } else if(s->kind==N_ASSIGN){
+        fmt_expr(b,s->a);
+        if(!strcmp(s->sval,"++"))      buf_puts(b,"++");
+        else if(!strcmp(s->sval,"--")) buf_puts(b,"--");
+        else { buf_printf(b," %s ",s->sval); fmt_expr(b,s->b); }
+    } else if(s->kind==N_EXPRSTMT){
+        fmt_expr(b,s->a);
+    } else {
+        fmt_expr(b,s);
+    }
+}
+
 /* execute / check / if can appear in value position; they format multi-line */
 static bool is_block_expr(Node *n){ return n && (n->kind==N_EXECUTE||n->kind==N_CHECK||n->kind==N_IF); }
 
@@ -3183,6 +3403,7 @@ static void fmt_construct(Buf *b, Node *n, int indlvl){
                     if(arm->b){ fmt_expr(b,arm->b); }
                     else if(arm->c){ buf_puts(b,arm->c->sval); }
                     else { buf_puts(b,arm->sval); if(arm->list.len){ buf_putc(b,'('); for(int j=0;j<arm->list.len;j++){ if(j)buf_puts(b,", "); buf_puts(b,((Node*)arm->list.items[j])->sval);} buf_putc(b,')'); } } }
+                if(arm->d){ buf_puts(b," if "); fmt_expr(b,arm->d); }
                 buf_puts(b,":\n"); fmt_block(b,arm->a,indlvl+2); }
             break;
         case N_EXECUTE:
@@ -3253,7 +3474,11 @@ static void fmt_stmt(Buf *b, Node *n, int indlvl){
         case N_IF: case N_CHECK: fmt_construct(b,n,indlvl); break;
         case N_LOOP_TILL:
             buf_puts(b,"loop till "); fmt_expr(b,n->a);
-            if(n->b){ buf_puts(b,"; "); /* init */ Node*s=n->b; if(s->kind==N_LET){buf_printf(b,"%s = ",s->sval);fmt_expr(b,s->a);} else fmt_expr(b,s->a?s->a:s); }
+            if(n->b || n->c){
+                buf_puts(b,"; ");
+                if(n->b) fmt_loop_clause(b,n->b);
+                if(n->c){ buf_puts(b,"; "); fmt_loop_clause(b,n->c); }
+            }
             buf_puts(b,":\n"); fmt_block(b,n->d,indlvl+1); break;
         case N_LOOP_THROUGH:
             buf_puts(b,"loop through "); fmt_expr(b,n->a); buf_puts(b,":\n"); fmt_block(b,n->b,indlvl+1); break;
@@ -3267,7 +3492,10 @@ static void fmt_stmt(Buf *b, Node *n, int indlvl){
         case N_COMPTIME: buf_puts(b,"comptime:\n"); fmt_block(b,n->a,indlvl+1); break;
         case N_UNSAFE: buf_puts(b,"unsafe:\n"); fmt_block(b,n->a,indlvl+1); break;
         case N_PARALLEL: buf_printf(b,"parallel scope %s:\n",n->sval); fmt_block(b,n->a,indlvl+1); break;
-        case N_IMPORT: buf_printf(b,"import %s\n",n->sval); break;
+        case N_IMPORT:
+            if(n->bval) buf_printf(b,"import \"%s\"\n",n->sval);
+            else        buf_printf(b,"import %s\n",n->sval);
+            break;
         case N_MODULE: buf_printf(b,"module %s\n",n->sval); break;
         default: fmt_expr(b,n); buf_putc(b,'\n');
     }

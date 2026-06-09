@@ -1,0 +1,7 @@
+def main(sys: System); Io:
+    # fractional literals are exact `decimal`s; scale is preserved exactly
+    println(type_name(2.5))
+    println(2.5, 1.5 + 2.5)
+    # division carries fixed precision; multiplication accumulates scale
+    println(10.0 / 4.0)
+    println(0.1 + 0.2)

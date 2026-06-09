@@ -127,7 +127,7 @@ cross-cutting decision C2 prescribes:
 - **property** — the formatter is idempotent: `fmt(fmt(x)) == fmt(x)`.
 
 The **equivalence harness** (`tests/equiv.sh`) is the self-hosting cross-check.
-For every program in the Keel-Core corpus (`tests/compiled/`) it runs the
+For every program in the Keel-Core corpus (`tests/determinism/equiv/`) it runs the
 program two ways — interpreted by the oracle, and compiled to a native binary by
 `keelc` — and requires identical stdout and exit. It passes with the compiler
 running interpreted *and* with the compiler running as a native binary.

@@ -1,0 +1,23 @@
+def classify(n: int); string:
+    if n < 0:
+        return "negative"
+    elif n == 0:
+        return "zero"
+    else:
+        return "positive"
+
+def main(sys: System); Io:
+    loop through [-2, 0, 5]:
+        println(classify(it))
+    mut acc = 0
+    loop till acc >= 100; mut i = 1; i++:
+        acc = acc + i
+    println("sum to >=100:", acc)
+    mut count = 0
+    loop:
+        count = count + 1
+        if count >= 3:
+            break
+    println("loop+break:", count)
+    x = 7
+    println("ternary:", x > 5 ? "big" : "small")

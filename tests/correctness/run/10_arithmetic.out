@@ -1,0 +1,7 @@
+add 5 sub 3 mul 42 div 3 mod 2
+pow 1024 neg -5 abs 9
+prec 14 paren 20
+bits 2 7 4 16 64
+cmp true true false true true
+bool false true false
+minmax 3 8

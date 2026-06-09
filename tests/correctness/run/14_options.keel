@@ -1,0 +1,15 @@
+def lookup(xs: array[int], target: int); int?:
+    mut idx = 0
+    loop through xs:
+        if it == target:
+            return some(idx)
+        idx = idx + 1
+    return none
+
+def main(sys: System); Io:
+    found = lookup([10, 20, 30], 20)
+    check found:
+        is some(i): println("found at", i)
+        is none: println("not found")
+    missing = lookup([10, 20], 99)
+    println("coalesce:", missing ?? -1)

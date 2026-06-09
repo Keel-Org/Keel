@@ -1,0 +1,23 @@
+def sign(n: int); int:
+    if n < 0:
+        return -1
+    elif n == 0:
+        return 0
+    else:
+        return 1
+
+def main(sys: System); Io:
+    loop through [-3, 0, 7]:
+        println(sign(it))
+    mut acc = 0
+    loop till acc >= 50; mut i = 1; i++:
+        acc = acc + i
+    println("acc:", acc)
+    mut c = 0
+    loop:
+        c = c + 1
+        if c == 2:
+            continue
+        if c >= 5:
+            break
+        println("c:", c)

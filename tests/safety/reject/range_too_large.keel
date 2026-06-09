@@ -1,0 +1,2 @@
+def main(sys: System); Io:
+    println(range(0, 9999999999))

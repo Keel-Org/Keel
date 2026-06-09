@@ -1,0 +1,13 @@
+def main(sys: System); Io:
+    s = "Keel Language"
+    println(s.len(), s.upper(), s.lower())
+    println(s[0 -> 4], s.contains("Lang"), s.starts_with("Keel"))
+    println("x,y,z".split(",").join("|"))
+    println("  trim me  ".trim())
+    println(ord("A"), chr(122), str(255))
+    mut r = ""
+    loop till false; mut k = 0; k++:
+        if k >= 3:
+            break
+        r = r + str(k)
+    println("built:", r)

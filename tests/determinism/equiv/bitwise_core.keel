@@ -1,0 +1,5 @@
+def main(sys: System); Io:
+    println(12 & 10, 12 | 10, 12 ^ 10, 1 << 8, 1024 >> 3, ~0)
+    println(2 + 3 & 7, (1 << 4) | (1 << 2))
+    println([3, 1, 2].sort(), [5, 1, 8].min(), [5, 1, 8].max())
+    println("a-b-c".replace("-", "+"), "x.keel".ends_with(".keel"))

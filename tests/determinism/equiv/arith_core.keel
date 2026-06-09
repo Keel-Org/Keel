@@ -1,0 +1,6 @@
+def main(sys: System); Io:
+    println(2 + 3, 7 - 4, 6 * 7, 20 / 6, 20 % 6, 2 ** 10)
+    println(3 < 4, 4 <= 4, 5 > 9, 2 == 2, 2 != 3)
+    println(2 + 3 * 4, (2 + 3) * 4, -5, abs(-9))
+    println(min(3, 8), max(3, 8))
+    println(true and false, true or false, not true)

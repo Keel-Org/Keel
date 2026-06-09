@@ -1,0 +1,9 @@
+def main(sys: System); Io:
+    println("and", 12 & 10, "or", 12 | 10, "xor", 12 ^ 10)
+    println("shl", 1 << 8, "shr", 1024 >> 3)
+    println("not", ~0, ~255)
+    println("prec", 2 + 3 & 7, 1 | 2 | 4)
+    mut flags = 0
+    flags = flags | 1
+    flags = flags | 4
+    println("flags", flags, "has4", flags & 4, "has2", flags & 2)

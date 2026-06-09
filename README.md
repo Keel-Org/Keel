@@ -21,14 +21,14 @@ make equiv      # check the self-hosted compiler agrees with the interpreter
 make all-checks # conform + bootstrap + equiv
 make test       # the integrated test runner (unit + property, with shrinking)
 
-./bin/keel run    tests/compiled/recursion.keel
-./bin/keel fmt    tests/compiled/strings.keel
-./bin/keel tokens tests/compiled/patterns.keel
-./bin/keel ast    tests/compiled/patterns.keel
-./bin/keel test   tests/property/05_tests.keel
+./bin/keel run    tests/determinism/equiv/recursion.keel
+./bin/keel fmt    tests/determinism/equiv/strings.keel
+./bin/keel tokens tests/determinism/equiv/patterns.keel
+./bin/keel ast    tests/determinism/equiv/patterns.keel
+./bin/keel test   tests/tooling/05_tests.keel
 
 # compile a Keel program to a native binary with the Keel-written compiler
-./keelc-build.sh tests/compiled/recursion.keel /tmp/rec && /tmp/rec
+./keelc-build.sh tests/determinism/equiv/recursion.keel /tmp/rec && /tmp/rec
 ```
 
 The CLI mirrors the toolchain vision in miniature: `run` (interpret), `test` (the integrated

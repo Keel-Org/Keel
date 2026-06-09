@@ -1,0 +1,4 @@
+def main(sys: System); Io:
+    name = "ada"
+    q = sql"select " + name
+    println(q)

@@ -1,0 +1,3 @@
+import "mods/bad_toplevel.keel"
+def main(sys: System); Io:
+    println(helper())

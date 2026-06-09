@@ -1,0 +1,14 @@
+struct Box:
+    w: int
+    h: int
+
+def area(b: Box); int:
+    return b.w * b.h
+
+def main(sys: System); Io:
+    boxes = [Box(2, 3), Box(4, 5), Box(1, 1)]
+    mut total_area = 0
+    loop through boxes:
+        total_area = total_area + area(it)
+    println("total area:", total_area)
+    println("first:", boxes[0].w, boxes[0].h)

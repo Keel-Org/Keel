@@ -1,0 +1,12 @@
+def safe_div(a: int, b: int); int / {Fail}:
+    if b == 0:
+        return fail("divide by zero")
+    return a / b
+
+def main(sys: System); Io:
+    r = execute:
+        safe_div(10, 0)?
+    handle Fail as e:
+        println("caught:", e)
+        resume -1
+    println("result:", r)

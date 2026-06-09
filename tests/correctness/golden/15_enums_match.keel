@@ -1,0 +1,13 @@
+derive (Eq, Debug)
+enum Tree:
+    Leaf(value: int)
+    Node(left: int, right: int)
+
+def tally(t: Tree); int:
+    check t:
+        is Leaf(v): return v
+        is Node(l, r): return l + r
+
+def main(sys: System); Io:
+    loop through [Leaf(5), Node(3, 4)]:
+        println("total =", tally(it))

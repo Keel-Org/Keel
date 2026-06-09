@@ -1,0 +1,8 @@
+def main(sys: System); Io:
+    println("add", 2 + 3, "sub", 7 - 4, "mul", 6 * 7, "div", 20 / 6, "mod", 20 % 6)
+    println("pow", 2 ** 10, "neg", -5, "abs", abs(-9))
+    println("prec", 2 + 3 * 4, "paren", (2 + 3) * 4)
+    println("bits", 6 & 3, 6 | 1, 5 ^ 1, 1 << 4, 256 >> 2)
+    println("cmp", 3 < 4, 4 <= 4, 5 > 9, 2 == 2, 2 != 3)
+    println("bool", true and false, true or false, not true)
+    println("minmax", min(3, 8), max(3, 8))

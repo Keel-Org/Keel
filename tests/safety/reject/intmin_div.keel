@@ -1,0 +1,4 @@
+def main(sys: System); Io:
+    mut m = -9223372036854775807
+    m = m - 1
+    println(m / -1)

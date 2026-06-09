@@ -1,0 +1,13 @@
+# Context-typed string escaping — the injection boundary (the real guarantee).
+# Each adversarial input must be neutralized for its sink context.
+def main(sys: System); Io:
+    sqli = "Robert'); DROP TABLE students; --"
+    println(sql"name = '#sqli'")
+    backslash = "a\\b'c"                       # MySQL backslash-escape bypass vector
+    println(sql"v = '#backslash'")
+    xss = "<script>alert(1)</script>"
+    println(html"<div>#xss</div>")
+    shellmeta = "; rm -rf / #"
+    println(shell"echo #shellmeta")
+    urlmeta = "a b&c=d/e?f"
+    println(url"https://x/?q=#urlmeta")

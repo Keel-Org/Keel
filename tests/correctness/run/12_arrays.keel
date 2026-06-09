@@ -1,0 +1,13 @@
+def main(sys: System); Io:
+    a = [5, 3, 8, 1]
+    println("len", a.len(), "first", a.first(), "last", a.last())
+    println("sum", a.sum(), "reverse", a.reverse())
+    doubled = a.map((x): x * 2)
+    println("map", doubled)
+    evens = a.filter((x): x % 2 == 0)
+    println("filter", evens)
+    println("broadcast", [1, 2, 3] * 10)
+    println("range", range(1, 5))
+    mut b = [1, 2]
+    b.push(3)
+    println("push", b, "empty?", [].is_empty())

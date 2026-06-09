@@ -1,0 +1,3 @@
+def main(sys: System); Io:
+    s = "hi"
+    println(s[99])

@@ -1,0 +1,2 @@
+def main(sys: System); Io:
+    assert_eq(1, 2)

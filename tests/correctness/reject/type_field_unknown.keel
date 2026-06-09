@@ -1,0 +1,5 @@
+struct P:
+    x: int
+def main(sys: System); Io:
+    p = P(1)
+    println(p.nonexistent)

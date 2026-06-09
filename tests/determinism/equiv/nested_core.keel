@@ -1,0 +1,14 @@
+def mul_table(n: int); int:
+    mut sum = 0
+    loop till false; mut i = 1; i++:
+        if i > n:
+            break
+        loop till false; mut j = 1; j++:
+            if j > n:
+                break
+            sum = sum + i * j
+    return sum
+
+def main(sys: System); Io:
+    loop through [1, 2, 3, 4]:
+        println("table sum", it, "=", mul_table(it))

@@ -35,10 +35,22 @@ static inline void kesc_putn(kesc_buf *b, const char *s, size_t k){
 static inline void kesc_putc(kesc_buf *b, char c){ kesc_putn(b,&c,1); }
 static inline void kesc_puts(kesc_buf *b, const char *s){ kesc_putn(b,s,strlen(s)); }
 
-/* SQL: single-quote doubling (the canonical parameterized-literal escape). */
+/* SQL: escape the backslash *and* double the single quote. Quote-doubling
+ * alone is unsafe on MySQL/MariaDB in their default mode (BACKSLASH_ESCAPES on),
+ * where a trailing `\` escapes the closing quote and lets input break out of the
+ * string literal — the classic incomplete-escape injection (cf. CWE-89,
+ * CVE-2026-33468). Escaping the backslash first closes that class; on
+ * ANSI/standard-conforming dialects (PostgreSQL, SQLite, SQL Server) a literal
+ * backslash is merely doubled, a benign data-fidelity cost, never an injection.
+ * The real long-term answer is parameter binding (Part IV's static sink check);
+ * this is the security-first runtime escape until then. */
 static inline char *kesc_sql(const char *s){
     kesc_buf b; kesc_init(&b);
-    for(const char *p=s;*p;p++){ if(*p=='\'') kesc_puts(&b,"''"); else kesc_putc(&b,*p); }
+    for(const char *p=s;*p;p++){
+        if(*p=='\'')      kesc_puts(&b,"''");
+        else if(*p=='\\') kesc_puts(&b,"\\\\");
+        else              kesc_putc(&b,*p);
+    }
     return b.p;
 }
 /* HTML: the five entity-significant characters. */

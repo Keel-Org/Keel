@@ -1,0 +1,13 @@
+def classify(n: int); string:
+    check n:
+        is x if x < 0: return "negative"
+        is 0: return "zero"
+        is x if x < 10: return "small"
+        is x if x < 100: return "medium"
+        else: return "large"
+def main(sys: System); Io:
+    println(classify(-5))
+    println(classify(0))
+    println(classify(7))
+    println(classify(50))
+    println(classify(999))

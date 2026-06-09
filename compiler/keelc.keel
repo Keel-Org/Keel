@@ -188,7 +188,7 @@ def lex(src: string); array[Token]:
         # ---- operators (longest match) ----
         d = i + 1 < n ? src[i + 1] : ""
         two = c + d
-        if two == "==" or two == "!=" or two == "<=" or two == ">=" or two == "->" or two == "++" or two == "--" or two == "+=" or two == "-=" or two == "*=" or two == "/=" or two == "%=" or two == "**" or two == "?." or two == "??":
+        if two == "==" or two == "!=" or two == "<=" or two == ">=" or two == "->" or two == "++" or two == "--" or two == "+=" or two == "-=" or two == "*=" or two == "/=" or two == "%=" or two == "**" or two == "?." or two == "??" or two == "<<" or two == ">>":
             toks = toks.push(mk_tok("op", two, line))
             i = i + 2
             continue
@@ -623,6 +623,14 @@ def prec_of(P: Parser); int:
         return 4
     if t == "->":
         return 5
+    if t == "|":
+        return 6
+    if t == "^":
+        return 7
+    if t == "&":
+        return 8
+    if t == "<<" or t == ">>":
+        return 9
     if t == "+" or t == "-":
         return 10
     if t == "*" or t == "/" or t == "%":
@@ -663,6 +671,9 @@ def parse_unary(P: Parser); Node:
     if at_op(P, "-"):
         padv(P)
         return {nk: "unary", op: "-", a: parse_unary(P)}
+    if at_op(P, "~"):
+        padv(P)
+        return {nk: "unary", op: "~", a: parse_unary(P)}
     e = parse_primary(P)
     return parse_postfix(P, e)
 
@@ -1070,6 +1081,8 @@ def emit_expr(G: Gen, e: Node); string:
     if k == "unary":
         if e.op == "not":
             return "kl_bool(!kl_truthy(" + emit_expr(G, e.a) + "))"
+        if e.op == "~":
+            return "kl_bnot(" + emit_expr(G, e.a) + ")"
         return "kl_neg(" + emit_expr(G, e.a) + ")"
     if k == "bin":
         return "kl_binop(\"" + e.op + "\"," + emit_expr(G, e.a) + "," + emit_expr(G, e.b) + ")"

@@ -1,0 +1,5 @@
+def main(sys: System); Io:
+    println(0xFF, 0x10, 0xDEAD)
+    println(0b1010, 0b1111_1111)
+    println(1_000_000, 1_234)
+    println(0xFF & 0x0F, 0xF0 | 0x0F, 1 << 4)

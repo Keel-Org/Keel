@@ -1,0 +1,19 @@
+enum Cmd:
+    Inc(int)
+    Dec(int)
+    Reset
+
+def apply(state: int, c: Cmd); int:
+    check c:
+        is Inc(n):
+            return state + n
+        is Dec(n):
+            return state - n
+        is Reset:
+            return 0
+
+def main(sys: System); Io:
+    mut state = 0
+    loop through [Inc(5), Inc(3), Dec(2), Reset, Inc(10)]:
+        state = apply(state, it)
+        println("state:", state)

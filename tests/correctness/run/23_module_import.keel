@@ -1,0 +1,5 @@
+import "mods/mathlib.keel"
+
+def main(sys: System); Io:
+    println("square(5) =", square(5))
+    println("cube(3) =", cube(3))
